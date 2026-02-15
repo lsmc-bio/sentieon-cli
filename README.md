@@ -55,5 +55,49 @@ The `sentieon-cli` supports the following global arguments:
 - [**DNAscope Hybrid**](https://support.sentieon.com/docs/sentieon_cli/#dnascope-hybrid) - DNAscope short-long-hybrid pipeline.
 - [**Sentieon Pangenome**](https://support.sentieon.com/docs/sentieon_cli/#sentieon-pangenome) - Sentieon pangenome alignment and variant calling. Our recommended pipeline for short-read small variant calling.
 
+## Snakemake Workflow (DNAscope Hybrid)
+
+A Snakemake version of the DNAscope Hybrid pipeline is available in `workflow/`. It mirrors the full DAG (22 rules) and provides **restart/resume** — if a run fails partway through, re-running the same command picks up where it left off.
+
+### Prerequisites
+
+In addition to the standard sentieon-cli prerequisites, you need:
+- [Snakemake](https://snakemake.readthedocs.io/) ≥ 7
+- `sentieon`, `samtools`, `bcftools`, `bedtools`, `mosdepth`, `multiqc`, `igzip` on `$PATH`
+
+### Quick start
+
+```sh
+# 1. Clone / pull the branch
+git fetch origin
+git checkout feature/snakemake-hybrid-workflow
+
+# 2. Copy the config template and fill in your paths
+cp workflow/config.hybrid.yaml workflow/my_run.yaml
+# Edit workflow/my_run.yaml — set reference, model_bundle, output_vcf,
+# sr_r1_fastq / sr_aln, lr_aln / lr_align_input, etc.
+
+# 3. Point temp to fast storage (recommended)
+export TMPDIR=/dev/shm  SENTIEON_TMPDIR=/dev/shm
+
+# 4. Dry-run to verify the DAG resolves
+snakemake -s workflow/Snakefile --configfile workflow/my_run.yaml -j 1 -n
+
+# 5. Execute
+snakemake -s workflow/Snakefile --configfile workflow/my_run.yaml -j <cores>
+
+# 6. If it fails partway, just re-run the same command — Snakemake resumes
+snakemake -s workflow/Snakefile --configfile workflow/my_run.yaml -j <cores>
+```
+
+### Cluster execution (Slurm example)
+
+```sh
+snakemake -s workflow/Snakefile \
+  --configfile workflow/my_run.yaml \
+  --cluster "sbatch -p <partition> -c {threads} --mem=64G" \
+  -j 8
+```
+
 ## License
 Unless otherwise indicated, files in this repository are licensed under a BSD 2-Clause License.
