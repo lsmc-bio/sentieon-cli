@@ -1,0 +1,814 @@
+"""
+Snakemake workflow for the Sentieon DNAscope Hybrid pipeline.
+
+Mirrors the DAG from sentieon_cli.dnascope_hybrid.DNAscopeHybridPipeline.build_dag()
+so that each original Job becomes a restartable Snakemake rule.
+
+Usage:
+    snakemake -s workflow/Snakefile --configfile workflow/config.hybrid.yaml -j <cores>
+
+Prerequisites:
+    sentieon, samtools, bcftools, bedtools, minimap2, mosdepth, multiqc, igzip (optional)
+"""
+
+import os
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+configfile: "workflow/config.hybrid.yaml"
+
+REFERENCE   = config["reference"]
+MODEL       = config["model_bundle"]
+OUTPUT_VCF  = config["output_vcf"]
+SAMPLE      = os.path.basename(OUTPUT_VCF).replace(".vcf.gz", "")
+CORES       = config.get("cores", workflow.cores)
+ASSAY       = config.get("assay", "WGS")      # WGS | WES
+GVCF        = config.get("gvcf", False)
+VCF_SUFFIX  = ".g.vcf.gz" if GVCF else ".vcf.gz"
+EMIT_MODE   = "--emit_mode gvcf" if GVCF else ""
+
+TMPDIR      = config.get("tmp_dir", "tmp")
+BED         = config.get("bed", "")
+BED_FLAG    = f"--interval {BED}" if BED else ""
+DBSNP       = config.get("dbsnp", "")
+DBSNP_FLAG  = f"--dbsnp {DBSNP}" if DBSNP else ""
+POP_VCF     = config.get("pop_vcf", "")
+
+# Short-read inputs (lists)
+SR_R1       = config.get("sr_r1_fastq", [])
+SR_R2       = config.get("sr_r2_fastq", [])
+SR_RG       = config.get("sr_readgroups", [])
+SR_ALN      = config.get("sr_aln", [])          # pre-aligned BAMs
+
+# Long-read inputs
+LR_ALN_INPUT = config.get("lr_align_input", [])  # BAMs to re-align
+LR_ALN       = config.get("lr_aln", [])          # pre-aligned BAMs
+
+# Feature flags
+SKIP_METRICS  = config.get("skip_metrics", False)
+SKIP_MOSDEPTH = config.get("skip_mosdepth", False)
+SKIP_MULTIQC  = config.get("skip_multiqc", False)
+SKIP_SVS      = config.get("skip_svs", False)
+SKIP_CNV      = config.get("skip_cnv", False)
+SKIP_MODEL    = config.get("skip_model_apply", False)
+DEDUP_MODE    = config.get("sr_duplicate_marking", "markdup")  # markdup|rmdup|none
+HYBRID_RG_SM  = config.get("hybrid_rg_sm", SAMPLE)
+
+# Derived paths
+METRICS_DIR   = OUTPUT_VCF.replace(".vcf.gz", "_metrics")
+DEDUPED       = OUTPUT_VCF.replace(".vcf.gz", "_deduped.bam")
+SORT_ARGS     = config.get("util_sort_args",
+                           "--cram_write_options version=3.0,compressor=rans")
+
+# Wildcard indices
+SR_FQ_IDX = list(range(len(SR_R1)))
+LR_IDX    = list(range(len(LR_ALN_INPUT)))
+
+# ---------------------------------------------------------------------------
+# Determine final targets
+# ---------------------------------------------------------------------------
+def final_targets():
+    targets = [OUTPUT_VCF]
+    if not SKIP_SVS and (LR_ALN or LR_ALN_INPUT):
+        targets.append(OUTPUT_VCF.replace(".vcf.gz", ".sv.vcf.gz"))
+    if not SKIP_CNV:
+        targets.append(OUTPUT_VCF.replace(".vcf.gz", ".cnv.vcf.gz"))
+    if not SKIP_METRICS:
+        targets.append(os.path.join(METRICS_DIR, "dedup_done.flag"))
+    if not SKIP_MOSDEPTH and (LR_ALN or LR_ALN_INPUT):
+        targets.extend(
+            [f"{OUTPUT_VCF.replace('.vcf.gz', '')}_mosdepth_{i}/done.flag"
+             for i in LR_IDX]
+        )
+    if not SKIP_MULTIQC and not SKIP_METRICS:
+        targets.append(os.path.join(METRICS_DIR, "multiqc_report.html"))
+    return targets
+
+
+rule all:
+    input: final_targets()
+
+
+# ===========================================================================
+# 1. SHORT-READ FASTQ ALIGNMENT  (one rule per FASTQ pair)
+# ===========================================================================
+rule sr_align_fastq:
+    """Align short-read FASTQs with sentieon bwa mem | util sort"""
+    input:
+        r1  = lambda wc: SR_R1[int(wc.i)],
+        r2  = lambda wc: SR_R2[int(wc.i)] if int(wc.i) < len(SR_R2) else [],
+        ref = REFERENCE,
+    output:
+        bam = os.path.join(TMPDIR, "bwa_sorted_fq_{i}_0.bam"),
+    params:
+        rg        = lambda wc: SR_RG[int(wc.i)],
+        model     = MODEL,
+        bwa_k     = config.get("bwa_k", "100000000"),
+        bwa_args  = config.get("bwa_args", ""),
+        sort_args = SORT_ARGS + " --bam_compression 1",
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        R2_ARG=""
+        if [ -n "{input.r2}" ]; then R2_ARG="{input.r2}"; fi
+
+        igzip -dc {input.r1} | paste - - - - | \
+        {{ [ -n "$R2_ARG" ] && igzip -dc "$R2_ARG" | paste - - - - | \
+           paste -d '\\n' - /dev/stdin || cat; }} | \
+        tr '\\t' '\\n' | \
+        sentieon bwa mem \
+            -R '{params.rg}' \
+            -t {threads} \
+            -x {params.model}/bwa.model \
+            {params.bwa_args} \
+            -K {params.bwa_k} \
+            {input.ref} /dev/stdin | \
+        sentieon util sort \
+            -i - -t {threads} \
+            --reference {input.ref} \
+            -o {output.bam} \
+            --sam2bam {params.sort_args}
+        """
+
+
+# ===========================================================================
+# 2. LOCUS COLLECTOR + METRICS  (short reads)
+# ===========================================================================
+rule locuscollector:
+    """LocusCollector + base QC metrics on aligned short reads"""
+    input:
+        bams = (
+            [os.path.join(TMPDIR, f"bwa_sorted_fq_{i}_0.bam") for i in SR_FQ_IDX]
+            + SR_ALN
+        ),
+        ref  = REFERENCE,
+    output:
+        score = os.path.join(METRICS_DIR, f"{SAMPLE}.txt.score.txt.gz"),
+    params:
+        input_flags = lambda wc, input: " ".join(f"-i {b}" for b in input.bams),
+        bed_flag    = BED_FLAG,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p {METRICS_DIR}
+        sentieon driver -r {input.ref} -t {threads} \
+            {params.input_flags} {params.bed_flag} \
+            --algo LocusCollector {output.score}
+        """
+
+
+# ===========================================================================
+# 3. DEDUP
+# ===========================================================================
+rule dedup:
+    """Duplicate marking / removal"""
+    input:
+        bams  = (
+            [os.path.join(TMPDIR, f"bwa_sorted_fq_{i}_0.bam") for i in SR_FQ_IDX]
+            + SR_ALN
+        ),
+        score = os.path.join(METRICS_DIR, f"{SAMPLE}.txt.score.txt.gz"),
+        ref   = REFERENCE,
+    output:
+        bam     = DEDUPED,
+        metrics = os.path.join(METRICS_DIR, f"{SAMPLE}.txt.dedup_metrics.txt"),
+        flag    = os.path.join(METRICS_DIR, "dedup_done.flag"),
+    params:
+        input_flags = lambda wc, input: " ".join(f"-i {b}" for b in input.bams),
+        rmdup       = "--rmdup" if DEDUP_MODE == "rmdup" else "",
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            {params.input_flags} \
+            --algo Dedup {params.rmdup} \
+            --score_info {input.score} \
+            --metrics {output.metrics} \
+            --cram_write_options version=3.0,compressor=rans \
+            {output.bam}
+        touch {output.flag}
+        """
+
+
+# ===========================================================================
+# 4. POST-DEDUP METRICS  (WGS or WES specific)
+# ===========================================================================
+rule post_dedup_metrics:
+    """Collect insert-size, WGS/WES metrics after dedup"""
+    input:
+        bam = DEDUPED,
+        ref = REFERENCE,
+    output:
+        flag = os.path.join(METRICS_DIR, "post_metrics_done.flag"),
+    params:
+        bed_flag = BED_FLAG,
+        assay    = ASSAY,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        ALGO_ARGS=""
+        ALGO_ARGS="$ALGO_ARGS --algo InsertSizeMetricAlgo {METRICS_DIR}/{SAMPLE}.txt.insert_size.txt"
+        ALGO_ARGS="$ALGO_ARGS --algo MeanQualityByCycle {METRICS_DIR}/{SAMPLE}.txt.mean_qual_by_cycle.txt"
+        ALGO_ARGS="$ALGO_ARGS --algo BaseDistributionByCycle {METRICS_DIR}/{SAMPLE}.txt.base_distribution_by_cycle.txt"
+        ALGO_ARGS="$ALGO_ARGS --algo QualDistribution {METRICS_DIR}/{SAMPLE}.txt.qual_distribution.txt"
+        ALGO_ARGS="$ALGO_ARGS --algo AlignmentStat {METRICS_DIR}/{SAMPLE}.txt.alignment_stat.txt"
+        if [ "{params.assay}" = "WGS" ]; then
+            ALGO_ARGS="$ALGO_ARGS --algo WgsMetricsAlgo --include_unpaired true {METRICS_DIR}/{SAMPLE}.txt.wgs.txt"
+            ALGO_ARGS="$ALGO_ARGS --algo CoverageMetrics {METRICS_DIR}/coverage"
+            ALGO_ARGS="$ALGO_ARGS --algo GCBias --summary {METRICS_DIR}/{SAMPLE}.txt.gc_bias_summary.txt {METRICS_DIR}/{SAMPLE}.txt.gc_bias.txt"
+        fi
+        if [ "{params.assay}" = "WES" ] && [ -n "{BED}" ]; then
+            ALGO_ARGS="$ALGO_ARGS --algo HsMetricAlgo --targets_list {BED} --baits_list {BED} {METRICS_DIR}/{SAMPLE}.txt.hybrid-selection.txt"
+        fi
+        sentieon driver -r {input.ref} -t {threads} \
+            -i {input.bam} {params.bed_flag} \
+            $ALGO_ARGS
+
+        # Rehead WGS metrics for MultiQC compatibility
+        if [ "{params.assay}" = "WGS" ]; then
+            REHEAD_SCRIPT=$(python -c \
+                "from importlib_resources import files; \
+                 print(files('sentieon_cli.scripts').joinpath('rehead_wgs_metrics.py'))")
+            sentieon pyexec "$REHEAD_SCRIPT" \
+                --metrics_file {METRICS_DIR}/{SAMPLE}.txt.wgs.txt
+        fi
+        touch {output.flag}
+        """
+
+
+
+# ===========================================================================
+# 5. LONG-READ RE-ALIGNMENT  (per input BAM/CRAM)
+# ===========================================================================
+rule lr_align:
+    """Re-align long reads with samtools fastq | sentieon minimap2 | util sort"""
+    input:
+        aln = lambda wc: LR_ALN_INPUT[int(wc.i)],
+        ref = REFERENCE,
+    output:
+        bam = OUTPUT_VCF.replace(".vcf.gz", "_mm2_sorted_{i}.cram"),
+    params:
+        model     = MODEL,
+        sort_args = SORT_ARGS,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        samtools fastq -@ {threads} -T '*' {input.aln} | \
+        sentieon minimap2 \
+            -t {threads} -a -y \
+            -x {params.model}/minimap2.model \
+            {input.ref} /dev/stdin | \
+        sentieon util sort \
+            -i - -t {threads} \
+            --reference {input.ref} \
+            -o {output.bam} \
+            --sam2bam {params.sort_args}
+        """
+
+
+# ===========================================================================
+# 6. MOSDEPTH QC  (per long-read input)
+# ===========================================================================
+rule mosdepth:
+    """Run mosdepth for long-read coverage QC"""
+    input:
+        bam = OUTPUT_VCF.replace(".vcf.gz", "_mm2_sorted_{i}.cram"),
+        ref = REFERENCE,
+    output:
+        flag = OUTPUT_VCF.replace(".vcf.gz", "") + "_mosdepth_{i}/done.flag",
+    params:
+        outdir = lambda wc: OUTPUT_VCF.replace(".vcf.gz", "") + f"_mosdepth_{wc.i}",
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        mosdepth --fasta {input.ref} --threads {threads} \
+            --by 500 --no-per-base --use-median \
+            -T 1,3,5,10,15,20,30,40,50 \
+            {params.outdir} {input.bam}
+        touch {output.flag}
+        """
+
+
+# ===========================================================================
+# 7. MULTIQC
+# ===========================================================================
+rule multiqc:
+    """Aggregate QC metrics with MultiQC"""
+    input:
+        metrics_flag = os.path.join(METRICS_DIR, "dedup_done.flag"),
+        post_flag    = (os.path.join(METRICS_DIR, "post_metrics_done.flag")
+                        if not SKIP_METRICS else []),
+    output:
+        html = os.path.join(METRICS_DIR, "multiqc_report.html"),
+    shell:
+        """
+        set -euo pipefail
+        multiqc -o {METRICS_DIR} -b "Generated by Sentieon-CLI Snakemake" {METRICS_DIR}
+        """
+
+
+# ===========================================================================
+# 8. STRUCTURAL VARIANT CALLING  (LongReadSV)
+# ===========================================================================
+rule longreadsv:
+    """Call SVs from long reads with Sentieon LongReadSV"""
+    input:
+        bams = (
+            [OUTPUT_VCF.replace(".vcf.gz", f"_mm2_sorted_{i}.cram") for i in LR_IDX]
+            + LR_ALN
+        ),
+        ref  = REFERENCE,
+    output:
+        vcf = OUTPUT_VCF.replace(".vcf.gz", ".sv.vcf.gz"),
+    params:
+        input_flags = lambda wc, input: " ".join(f"-i {b}" for b in input.bams),
+        model       = MODEL,
+        bed_flag    = BED_FLAG,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            {params.input_flags} {params.bed_flag} \
+            --algo LongReadSV \
+            --model {params.model}/longreadsv.model \
+            {output.vcf}
+        """
+
+
+# ===========================================================================
+# 9. CNV CALLING  (CNVscope + CNVModelApply)
+# ===========================================================================
+rule cnvscope:
+    """Call CNVs with Sentieon CNVscope"""
+    input:
+        bam = DEDUPED,
+        ref = REFERENCE,
+    output:
+        vcf = os.path.join(TMPDIR, "cnvscope.vcf.gz"),
+    params:
+        model    = MODEL,
+        bed_flag = BED_FLAG,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            -i {input.bam} {params.bed_flag} \
+            --algo CNVscope --model {params.model}/cnv.model \
+            {output.vcf}
+        """
+
+rule cnvmodelapply:
+    """Apply CNV model to CNVscope output"""
+    input:
+        vcf = os.path.join(TMPDIR, "cnvscope.vcf.gz"),
+        ref = REFERENCE,
+    output:
+        vcf = OUTPUT_VCF.replace(".vcf.gz", ".cnv.vcf.gz"),
+    params:
+        model = MODEL,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            --algo CNVModelApply \
+            --model {params.model}/cnv.model \
+            --vcf {input.vcf} \
+            {output.vcf}
+        """
+
+
+# ===========================================================================
+# 10. HYBRID VARIANT CALLING — PASS 1  (combined SR+LR)
+# ===========================================================================
+# Collect all aligned inputs for calling
+_LR_BAMS = [OUTPUT_VCF.replace(".vcf.gz", f"_mm2_sorted_{i}.cram") for i in LR_IDX] + LR_ALN
+_SR_BAMS = [DEDUPED] if DEDUP_MODE != "none" else (
+    [os.path.join(TMPDIR, f"bwa_sorted_fq_{i}_0.bam") for i in SR_FQ_IDX] + SR_ALN
+)
+
+rule calling_pass1:
+    """First-pass combined variant calling (DNAscope) on LR+SR"""
+    input:
+        lr_bams = _LR_BAMS,
+        sr_bams = _SR_BAMS,
+        ref     = REFERENCE,
+    output:
+        vcf = os.path.join(TMPDIR, "initial" + VCF_SUFFIX),
+    params:
+        input_flags = lambda wc, input: (
+            " ".join(f"-i {b}" for b in input.lr_bams)
+            + " " + " ".join(f"-i {b}" for b in input.sr_bams)
+        ),
+        model    = MODEL,
+        bed_flag = BED_FLAG,
+        dbsnp    = DBSNP_FLAG,
+        emit     = EMIT_MODE,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            {params.input_flags} {params.bed_flag} \
+            --algo DNAscope \
+            --model {params.model}/hybrid.model \
+            --pcr_indel_model none \
+            {params.dbsnp} {params.emit} \
+            {output.vcf}
+        """
+
+
+# ===========================================================================
+# 11. HYBRID SELECT  (region selection from pass-1 VCF)
+# ===========================================================================
+rule hybrid_select:
+    """Select regions for hybrid re-analysis"""
+    input:
+        vcf     = os.path.join(TMPDIR, "initial" + VCF_SUFFIX),
+        ref_fai = REFERENCE + ".fai",
+    output:
+        bed = os.path.join(TMPDIR, "selected.bed"),
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon pyexec $(python -c \
+            "from importlib_resources import files; \
+             print(files('sentieon_cli.scripts').joinpath('hybrid_select.py'))") \
+            -v {input.vcf} -t {threads} \
+            --ref_fai {input.ref_fai} --slop 1000 \
+            -o {output.bed}
+        """
+
+
+# ===========================================================================
+# 12. MAPQ0 REGION DETECTION
+# ===========================================================================
+rule mapq0_bed:
+    """Detect MAPQ0 regions with HybridStage2 region model"""
+    input:
+        lr_bams = _LR_BAMS,
+        sr_bams = _SR_BAMS,
+        ref     = REFERENCE,
+    output:
+        bed = os.path.join(TMPDIR, "hybrid_mapq0.bed"),
+    params:
+        input_flags = lambda wc, input: (
+            " ".join(f"-i {b}" for b in input.lr_bams)
+            + " " + " ".join(f"-i {b}" for b in input.sr_bams)
+        ),
+        model = MODEL,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            {params.input_flags} \
+            --algo HybridStage2 \
+            --model {params.model}/HybridStage2_region.model \
+            --all_bed {output.bed}
+        """
+
+
+rule mapq0_bed_slop:
+    """Extend MAPQ0 regions by 1000 bp"""
+    input:
+        bed     = os.path.join(TMPDIR, "hybrid_mapq0.bed"),
+        ref_fai = REFERENCE + ".fai",
+    output:
+        bed = os.path.join(TMPDIR, "hybrid_mapq0.ex1000.bed"),
+    shell:
+        """
+        set -euo pipefail
+        bedtools slop -b 1000 -g {input.ref_fai} -i {input.bed} > {output.bed}
+        """
+
+
+# ===========================================================================
+# 13. MERGE SELECTED + MAPQ0 BEDS
+# ===========================================================================
+rule concat_merge_bed:
+    """Cat, sort, merge selected.bed + mapq0.ex1000.bed → merged_diff.bed"""
+    input:
+        selected = os.path.join(TMPDIR, "selected.bed"),
+        mapq0    = os.path.join(TMPDIR, "hybrid_mapq0.ex1000.bed"),
+        ref_fai  = REFERENCE + ".fai",
+    output:
+        bed = os.path.join(TMPDIR, "merged_diff.bed"),
+    shell:
+        """
+        set -euo pipefail
+        cat {input.selected} {input.mapq0} | \
+        bedtools sort -faidx {input.ref_fai} -i - | \
+        bedtools merge > {output.bed}
+        """
+
+
+# ===========================================================================
+# 14. HYBRID STAGE 1  (insertion + haplotype assembly → bwa realign)
+# ===========================================================================
+rule hybrid_stage1:
+    """Stage1: insertion detection + haplotype assembly piped through bwa"""
+    input:
+        lr_bams  = _LR_BAMS,
+        diff_bed = os.path.join(TMPDIR, "merged_diff.bed"),
+        ref      = REFERENCE,
+    output:
+        bam     = os.path.join(TMPDIR, "hybrid_stage1.bam"),
+        hap_bam = os.path.join(TMPDIR, "stage1_hap.bam"),
+        hap_bed = os.path.join(TMPDIR, "stage1_hap.bed"),
+        hap_vcf = os.path.join(TMPDIR, "stage1_hap.vcf"),
+        ins_fa  = os.path.join(TMPDIR, "stage1_ins.fa"),
+        ins_bed = os.path.join(TMPDIR, "stage1_ins.bed"),
+    params:
+        lr_input = lambda wc, input: " ".join(f"-i {b}" for b in input.lr_bams),
+        model    = MODEL,
+        rg_sm    = HYBRID_RG_SM,
+    threads: CORES
+    shell:
+        r"""
+        set -euo pipefail
+
+        # Stage1 haplotype driver (writes to stdout FASTQ + hap_bam/bed/vcf)
+        # Stage1 insertion driver (writes to stdout FASTQ + ins_fa/bed)
+        # Both stdout streams piped through cat into bwa mem → util sort
+
+        # Haplotype assembly driver
+        HAP_CMD="sentieon driver -r {input.ref} -t {threads} \
+            {params.lr_input} --interval {input.diff_bed} \
+            --algo HybridStage1 \
+            --model {params.model}/HybridStage1.model \
+            --hap_bam {output.hap_bam} \
+            --hap_bed {output.hap_bed} \
+            --hap_vcf {output.hap_vcf} \
+            -"
+
+        # Insertion detection driver
+        INS_CMD="sentieon driver -r {input.ref} -t {threads} \
+            {params.lr_input} \
+            --algo HybridStage1 \
+            --model {params.model}/HybridStage1_ins.model \
+            --fa_file {output.ins_fa} \
+            --bed_file {output.ins_bed} \
+            -"
+
+        # Cat both FASTQ streams → bwa mem → util sort
+        cat <($HAP_CMD) <($INS_CMD) | \
+        sentieon bwa mem \
+            -R "@RG\tID:hybrid-18893\tSM:{params.rg_sm}" \
+            -t {threads} \
+            -x {params.model}/HybridStage1_bwa.model \
+            {input.ref} - | \
+        sentieon util sort \
+            -i - -t {threads} \
+            -o {output.bam} --sam2bam
+        """
+
+
+# ===========================================================================
+# 15. HYBRID STAGE 2  (unmapped + alt alignment generation)
+# ===========================================================================
+rule hybrid_stage2:
+    """Stage2: generate unmap BAM, alt BAM, and refined BED"""
+    input:
+        stage1_bam = os.path.join(TMPDIR, "hybrid_stage1.bam"),
+        hap_bam    = os.path.join(TMPDIR, "stage1_hap.bam"),
+        hap_bed    = os.path.join(TMPDIR, "stage1_hap.bed"),
+        ref        = REFERENCE,
+    output:
+        bed       = os.path.join(TMPDIR, "hybrid_stage2.bed"),
+        unmap_bam = os.path.join(TMPDIR, "hybrid_stage2_unmap.bam"),
+        alt_bam   = os.path.join(TMPDIR, "hybrid_stage2_alt.bam"),
+    params:
+        model = MODEL,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            -i {input.stage1_bam} -i {input.hap_bam} \
+            --algo HybridStage2 \
+            --model {params.model}/HybridStage2.model \
+            --hap_bed {input.hap_bed} \
+            --unmap_bam {output.unmap_bam} \
+            --alt_bam {output.alt_bam} \
+            --all_bed {output.bed}
+        """
+
+
+# ===========================================================================
+# 16. HYBRID STAGE 3  (re-alignment with stage2 outputs)
+# ===========================================================================
+rule hybrid_stage3:
+    """Stage3: HybridStage3 on all reads + stage2 BAMs → sorted BAM"""
+    input:
+        lr_bams   = _LR_BAMS,
+        sr_bams   = _SR_BAMS,
+        unmap_bam = os.path.join(TMPDIR, "hybrid_stage2_unmap.bam"),
+        alt_bam   = os.path.join(TMPDIR, "hybrid_stage2_alt.bam"),
+        bed       = os.path.join(TMPDIR, "hybrid_stage2.bed"),
+        ref       = REFERENCE,
+    output:
+        bam = os.path.join(TMPDIR, "hybrid_stage3.bam"),
+    params:
+        input_flags = lambda wc, input: (
+            " ".join(f"-i {b}" for b in input.lr_bams)
+            + " " + " ".join(f"-i {b}" for b in input.sr_bams)
+            + f" -i {input.unmap_bam} -i {input.alt_bam}"
+        ),
+        model = MODEL,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            {params.input_flags} \
+            --interval {input.bed} \
+            --algo HybridStage3 \
+            --model {params.model}/HybridStage3.model \
+            - | \
+        sentieon util sort \
+            -i - -t {threads} \
+            -o {output.bam}
+        """
+
+
+# ===========================================================================
+# 17. VARIANT CALLING — PASS 2  (on refined regions)
+# ===========================================================================
+rule calling_pass2:
+    """Second-pass variant calling on stage3 BAM + LR reads"""
+    input:
+        lr_bams   = _LR_BAMS,
+        stage3    = os.path.join(TMPDIR, "hybrid_stage3.bam"),
+        bed       = os.path.join(TMPDIR, "hybrid_stage2.bed"),
+        ref       = REFERENCE,
+    output:
+        vcf = os.path.join(TMPDIR, "hybrid_pass2.vcf.gz"),
+    params:
+        lr_input = lambda wc, input: " ".join(f"-i {b}" for b in input.lr_bams),
+        model    = MODEL,
+        dbsnp    = DBSNP_FLAG,
+        emit     = EMIT_MODE,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            {params.lr_input} -i {input.stage3} \
+            --interval {input.bed} \
+            --algo DNAscope \
+            --model {params.model}/hybrid.model \
+            --pcr_indel_model none \
+            {params.dbsnp} {params.emit} \
+            {output.vcf}
+        """
+
+
+# ===========================================================================
+# 18. SUBSET + CONCAT  (merge pass1 complement + pass2)
+# ===========================================================================
+rule subset_calls:
+    """Subset pass-1 VCF to complement of stage2 regions"""
+    input:
+        vcf = os.path.join(TMPDIR, "initial" + VCF_SUFFIX),
+        bed = os.path.join(TMPDIR, "hybrid_stage2.bed"),
+    output:
+        vcf = os.path.join(TMPDIR, "mix_subset.vcf.gz"),
+    shell:
+        """
+        set -euo pipefail
+        bcftools view -T ^{input.bed} {input.vcf} | \
+        sentieon util vcfconvert - {output.vcf}
+        """
+
+rule concat_calls:
+    """Concatenate subset + pass2 VCFs"""
+    input:
+        subset = os.path.join(TMPDIR, "mix_subset.vcf.gz"),
+        pass2  = os.path.join(TMPDIR, "hybrid_pass2.vcf.gz"),
+    output:
+        vcf = os.path.join(TMPDIR, "combined_tmp.vcf.gz"),
+    shell:
+        """
+        set -euo pipefail
+        bcftools concat -W=tbi --output {output.vcf} -aD {input.subset} {input.pass2}
+        """
+
+
+# ===========================================================================
+# 19. ANNOTATION  (hybrid_anno)
+# ===========================================================================
+# Determine annotation output target based on downstream steps
+_ANNO_TARGET = os.path.join(TMPDIR, "combined_tmp_anno.vcf.gz")
+if SKIP_MODEL and not POP_VCF:
+    _ANNO_TARGET = OUTPUT_VCF
+
+rule anno_calls:
+    """Annotate VCF with hybrid-specific annotations"""
+    input:
+        vcf     = os.path.join(TMPDIR, "combined_tmp.vcf.gz"),
+        hap_bed = os.path.join(TMPDIR, "stage1_hap.bed"),
+    output:
+        vcf = _ANNO_TARGET,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        ANNO_SCRIPT=$(python -c \
+            "from importlib_resources import files; \
+             print(files('sentieon_cli.scripts').joinpath('hybrid_anno.py'))")
+        sentieon pyexec "$ANNO_SCRIPT" \
+            -v {input.vcf} -b {input.hap_bed} \
+            -t {threads} -o {output.vcf}
+        """
+
+
+# ===========================================================================
+# 20. ANNOTATION TRANSFER  (optional, from population VCF)
+# ===========================================================================
+_TRANSFER_TARGET = os.path.join(TMPDIR, "combined_tmp_transfer.vcf.gz")
+if SKIP_MODEL and POP_VCF:
+    _TRANSFER_TARGET = OUTPUT_VCF
+
+if POP_VCF:
+    rule annotation_transfer:
+        """Transfer annotations from population VCF using bcftools merge"""
+        input:
+            anno_vcf = _ANNO_TARGET,
+            pop_vcf  = POP_VCF,
+        output:
+            vcf = _TRANSFER_TARGET,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            TRIM_SCRIPT=$(python -c \
+                "from importlib_resources import files; \
+                 print(files('sentieon_cli.scripts').joinpath('trimalt.py'))")
+
+            bcftools merge --no-version --regions-overlap pos -m all \
+                {input.anno_vcf} {input.pop_vcf} | \
+            sentieon pyexec "$TRIM_SCRIPT" | \
+            bcftools concat -W=tbi --output {output.vcf} \
+                --no-version --threads {threads} -aD -
+            """
+
+
+# ===========================================================================
+# 21. MODEL APPLY  (DNAModelApply — optional)
+# ===========================================================================
+# Input to model-apply depends on whether transfer was run
+_APPLY_INPUT = _TRANSFER_TARGET if POP_VCF else _ANNO_TARGET
+
+if not SKIP_MODEL:
+    rule model_apply:
+        """Apply ML model to called variants"""
+        input:
+            vcf = _APPLY_INPUT,
+            ref = REFERENCE,
+        output:
+            vcf = os.path.join(TMPDIR, "combined_apply.vcf.gz"),
+        params:
+            model    = MODEL,
+            bed_flag = BED_FLAG,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} {params.bed_flag} \
+                --algo DNAModelApply \
+                --model {params.model}/hybrid.model \
+                --vcf {input.vcf} \
+                {output.vcf}
+            """
+
+
+    # ========================================================================
+    # 22. FINAL NORMALIZATION
+    # ========================================================================
+    _EXCL = '-e \'GT="0/0"\'' if not GVCF else ""
+
+    rule final_norm:
+        """Trim, normalize, and produce final output VCF"""
+        input:
+            vcf = os.path.join(TMPDIR, "combined_apply.vcf.gz"),
+            ref = REFERENCE,
+        output:
+            vcf = OUTPUT_VCF,
+        shell:
+            """
+            set -euo pipefail
+            bcftools view -a {_EXCL} {input.vcf} | \
+            bcftools norm -f {input.ref} | \
+            sentieon util vcfconvert - {output.vcf}
+            """

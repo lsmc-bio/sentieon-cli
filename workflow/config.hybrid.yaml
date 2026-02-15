@@ -1,0 +1,67 @@
+# ===========================================================================
+# Sentieon DNAscope Hybrid — Snakemake Configuration
+# ===========================================================================
+#
+# Copy this file, fill in paths, and run:
+#   snakemake -s workflow/Snakefile --configfile workflow/config.hybrid.yaml -j <cores>
+#
+# Tip: set TMPDIR and SENTIEON_TMPDIR to fast storage before running:
+#   export TMPDIR=/dev/shm  SENTIEON_TMPDIR=/dev/shm
+# ===========================================================================
+
+# ---- Required ----
+reference:     "/path/to/reference.fa"        # FASTA (+ .fai index)
+model_bundle:  "/path/to/hybrid_model_bundle"  # Sentieon model bundle directory
+output_vcf:    "/path/to/sample.vcf.gz"        # Final output VCF (must end .vcf.gz)
+
+# ---- Short-read inputs (provide FASTQ *or* pre-aligned BAM, or both) ----
+# FASTQ pairs: each list entry is one lane / read-group
+sr_r1_fastq: []
+  # - /path/to/sample_L001_R1.fastq.gz
+  # - /path/to/sample_L002_R1.fastq.gz
+sr_r2_fastq: []
+  # - /path/to/sample_L001_R2.fastq.gz
+  # - /path/to/sample_L002_R2.fastq.gz
+sr_readgroups: []
+  # - "@RG\\tID:L001\\tSM:sample\\tPL:ILLUMINA"
+  # - "@RG\\tID:L002\\tSM:sample\\tPL:ILLUMINA"
+
+# Pre-aligned short-read BAM/CRAM (already aligned to the same reference)
+sr_aln: []
+  # - /path/to/short_reads.bam
+
+# ---- Long-read inputs ----
+# BAM/CRAM/uBAM to re-align with minimap2 (one entry per input file)
+lr_align_input: []
+  # - /path/to/long_reads.bam
+
+# Pre-aligned long-read BAM/CRAM (skip re-alignment)
+lr_aln: []
+  # - /path/to/long_reads_aligned.cram
+
+# ---- Optional reference files ----
+bed:    ""   # BED file to restrict diploid variant calling
+dbsnp:  ""   # dbSNP VCF for variant annotation
+pop_vcf: ""  # Population VCF for DNAModelApply annotation transfer
+
+# ---- Pipeline behaviour ----
+cores:   0         # 0 = use Snakemake -j value
+assay:   "WGS"     # WGS | WES
+gvcf:    false     # true → emit gVCF
+sr_duplicate_marking: "markdup"  # markdup | rmdup | none
+hybrid_rg_sm: ""   # Override SM tag (default: derived from output_vcf basename)
+tmp_dir: "tmp"     # Directory for intermediate files
+
+# ---- Feature flags (set true to skip) ----
+skip_metrics:     false
+skip_mosdepth:    false
+skip_multiqc:     false
+skip_svs:         false
+skip_cnv:         false
+skip_model_apply: false
+
+# ---- Advanced / hidden (rarely changed) ----
+bwa_args:       ""
+bwa_k:          100000000
+util_sort_args: "--cram_write_options version=3.0,compressor=rans"
+
