@@ -99,5 +99,84 @@ snakemake -s workflow/Snakefile \
   -j 8
 ```
 
+## Snakemake Workflow (DNAscope LongRead — ONT / PacBio)
+
+Covers the full DNAscope LongRead pipeline (~40 rules) for PacBio HiFi and Oxford Nanopore data. Includes multi-pass phasing-based variant calling, SV/CNV calling, and optional haploid-region handling.
+
+### Quick start
+
+```sh
+# Copy the config template and fill in your paths
+cp workflow/config.longread.yaml workflow/my_lr_run.yaml
+# Edit workflow/my_lr_run.yaml — set reference, model_bundle, output_vcf, tech (HiFi/ONT),
+# and either sample_input (BAMs) or fastq + readgroups.
+
+# Point temp to fast storage (recommended)
+export TMPDIR=/dev/shm  SENTIEON_TMPDIR=/dev/shm
+
+# Dry-run
+snakemake -s workflow/Snakefile.longread --configfile workflow/my_lr_run.yaml -j 1 -n
+
+# Execute
+snakemake -s workflow/Snakefile.longread --configfile workflow/my_lr_run.yaml -j <cores>
+
+# Resume after failure
+snakemake -s workflow/Snakefile.longread --configfile workflow/my_lr_run.yaml -j <cores>
+```
+
+### Cluster execution (Slurm example)
+
+```sh
+snakemake -s workflow/Snakefile.longread \
+  --configfile workflow/my_lr_run.yaml \
+  --cluster "sbatch -p <partition> -c {threads} --mem=64G" \
+  -j 8
+```
+
+---
+
+## Snakemake Workflow (Sentieon Pangenome — Illumina / Ultima)
+
+Covers the Sentieon Pangenome pipeline (15 rules) — the recommended approach for short-read small variant calling. Uses pangenome graph alignment via `vg` and dual BWA + minimap2 alignment strategy.
+
+### Prerequisites (in addition to above)
+
+- `kmc` (patched version from [Sentieon/KMC](https://github.com/Sentieon/KMC/releases) required for BAM input mode)
+- `vg` (variation graph toolkit)
+- `igzip` (optional, falls back to `gzip`)
+
+### Quick start
+
+```sh
+# Copy the config template and fill in your paths
+cp workflow/config.pangenome.yaml workflow/my_pg_run.yaml
+# Edit workflow/my_pg_run.yaml — set reference, model_bundle, output_vcf,
+# gbz, hapl, pop_vcf (required), and either r1_fastq+r2_fastq+readgroup
+# or sample_input (BAMs).
+
+# Point temp to fast storage (recommended)
+export TMPDIR=/dev/shm  SENTIEON_TMPDIR=/dev/shm
+
+# Dry-run
+snakemake -s workflow/Snakefile.pangenome --configfile workflow/my_pg_run.yaml -j 1 -n
+
+# Execute
+snakemake -s workflow/Snakefile.pangenome --configfile workflow/my_pg_run.yaml -j <cores>
+
+# Resume after failure
+snakemake -s workflow/Snakefile.pangenome --configfile workflow/my_pg_run.yaml -j <cores>
+```
+
+### Cluster execution (Slurm example)
+
+```sh
+snakemake -s workflow/Snakefile.pangenome \
+  --configfile workflow/my_pg_run.yaml \
+  --cluster "sbatch -p <partition> -c {threads} --mem=64G" \
+  -j 8
+```
+
+---
+
 ## License
 Unless otherwise indicated, files in this repository are licensed under a BSD 2-Clause License.

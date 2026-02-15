@@ -1,0 +1,62 @@
+# ==========================================================================
+# Sentieon Pangenome — Snakemake config template
+# ==========================================================================
+# Copy this file, fill in your paths, then run:
+#   snakemake -s workflow/Snakefile.pangenome --configfile workflow/my_run.yaml -j <cores>
+
+# --------------------------------------------------------------------------
+# Required inputs
+# --------------------------------------------------------------------------
+reference:      /path/to/GRCh38.fa             # Reference FASTA (indexed)
+model_bundle:   /path/to/model_bundle          # Sentieon pangenome model bundle dir
+output_vcf:     /path/to/output.vcf.gz         # Final output VCF path
+gbz:            /path/to/hprc-v2.0-mc-grch38.gbz   # Pangenome GBZ file
+hapl:           /path/to/hprc-v2.0-mc-grch38.hapl   # Pangenome haplotype index
+pop_vcf:        /path/to/population.vcf.gz     # Population VCF (REQUIRED for pangenome)
+
+# Technology: "ILLUMINA" or "ULTIMA"
+tech: ILLUMINA
+
+# --------------------------------------------------------------------------
+# Input data — provide EITHER FASTQ (r1+r2+readgroup) OR sample_input (BAMs)
+# --------------------------------------------------------------------------
+# FASTQ mode (paired-end)
+r1_fastq: []
+#  - /path/to/R1_001.fastq.gz
+#  - /path/to/R1_002.fastq.gz
+r2_fastq: []
+#  - /path/to/R2_001.fastq.gz
+#  - /path/to/R2_002.fastq.gz
+readgroup: ""
+# e.g. "@RG\\tID:sample\\tSM:sample\\tPL:ILLUMINA"
+
+# BAM/CRAM mode (mutually exclusive with FASTQ)
+sample_input: []
+#  - /path/to/sample.bam
+
+# --------------------------------------------------------------------------
+# Optional inputs
+# --------------------------------------------------------------------------
+# bed:                ""             # Target regions BED (recommended)
+# dbsnp:              ""             # dbSNP VCF for annotation
+
+# --------------------------------------------------------------------------
+# Pipeline behaviour
+# --------------------------------------------------------------------------
+# cores:              64             # Max threads (default: workflow cores)
+# tmp_dir:            tmp            # Working directory for intermediates
+# bam_format:         false          # Use BAM instead of CRAM for aligned output
+# pcr_free:           false          # Set PCR indel model to NONE
+
+# --------------------------------------------------------------------------
+# Feature flags (set true to skip)
+# --------------------------------------------------------------------------
+# skip_metrics:       false          # Skip metrics collection
+# skip_multiqc:       false          # Skip MultiQC report
+# skip_model_apply:   false          # Skip DNAModelApply (output raw transfer VCF)
+
+# --------------------------------------------------------------------------
+# Advanced / hidden options
+# --------------------------------------------------------------------------
+# kmer_memory:        30             # KMC memory limit (GB)
+

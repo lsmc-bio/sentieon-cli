@@ -1,0 +1,549 @@
+"""
+Snakemake workflow for the Sentieon Pangenome pipeline.
+
+Mirrors the DAG from sentieon_cli.sentieon_pangenome.SentieonPangenome.build_first_dag()
+so that each original Job becomes a restartable Snakemake rule.
+
+Recommended for short-read data (Illumina, Ultima).
+
+Usage:
+    snakemake -s workflow/Snakefile.pangenome --configfile workflow/config.pangenome.yaml -j <cores>
+
+Prerequisites:
+    sentieon, samtools, bcftools, kmc, vg, igzip (optional), multiqc (optional)
+"""
+
+import os
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+configfile: "workflow/config.pangenome.yaml"
+
+REFERENCE   = config["reference"]
+MODEL       = config["model_bundle"]
+OUTPUT_VCF  = config["output_vcf"]
+GBZ         = config["gbz"]
+HAPL        = config["hapl"]
+POP_VCF     = config["pop_vcf"]              # required for pangenome
+SAMPLE      = os.path.basename(OUTPUT_VCF).replace(".vcf.gz", "")
+CORES       = config.get("cores", workflow.cores)
+BAM_FMT     = config.get("bam_format", False)
+ALN_SUFFIX  = "bam" if BAM_FMT else "cram"
+
+TMPDIR      = config.get("tmp_dir", "tmp")
+BED         = config.get("bed", "")
+BED_FLAG    = f"--interval {BED}" if BED else ""
+DBSNP       = config.get("dbsnp", "")
+DBSNP_FLAG  = f"--dbsnp {DBSNP}" if DBSNP else ""
+PCR_FREE    = config.get("pcr_free", False)
+KMC_MEMORY  = config.get("kmer_memory", 30)
+
+# Inputs — FASTQ mode (paired-end)
+R1_FASTQ    = config.get("r1_fastq", [])
+R2_FASTQ    = config.get("r2_fastq", [])
+READGROUP   = config.get("readgroup", "")
+
+# Inputs — BAM mode
+SAMPLE_INPUT = config.get("sample_input", [])
+
+# Feature flags
+SKIP_METRICS  = config.get("skip_metrics", False)
+SKIP_MULTIQC  = config.get("skip_multiqc", False)
+SKIP_MODEL    = config.get("skip_model_apply", False)
+
+# Technology (detected from bundle, but can be overridden)
+TECH = config.get("tech", "ILLUMINA")     # ILLUMINA | ULTIMA
+
+# Input mode: FASTQ or BAM
+_FASTQ_MODE = len(R1_FASTQ) > 0
+
+# ---------------------------------------------------------------------------
+# Script helpers (resolved at runtime in shell blocks)
+# ---------------------------------------------------------------------------
+_TRIMALT = (
+    '$(python3 -c "from importlib_resources import files;'
+    " print(files('sentieon_cli.scripts').joinpath('trimalt.py'))\\\")"
+)
+_REHEAD = (
+    '$(python3 -c "from importlib_resources import files;'
+    " print(files('sentieon_cli.scripts').joinpath('rehead_wgs_metrics.py'))\\\")"
+)
+
+# ---------------------------------------------------------------------------
+# Derived paths
+# ---------------------------------------------------------------------------
+_BWA_BAM       = os.path.join(TMPDIR, "sample-bwa.bam")
+_EXT_FASTQ     = os.path.join(TMPDIR, "sample-bwa.fq.gz")
+_KMER_PREFIX   = os.path.join(TMPDIR, "sample.fq")
+_KMER_FILE     = _KMER_PREFIX + ".kff"
+_KMER_PATHS    = _KMER_PREFIX + ".paths"
+_SAMPLE_PAN    = os.path.join(TMPDIR, "sample_pangenome.gbz")
+_SAMPLE_GFA    = os.path.join(TMPDIR, "sample-hap.gfa")
+_SAMPLE_FASTA  = os.path.join(TMPDIR, "sample-hap.fa")
+_MM2_BAM       = os.path.join(TMPDIR, "sample-mm2.bam")
+_RAW_VCF       = os.path.join(TMPDIR, "sample-dnascope.vcf.gz")
+_TRANSFER_VCF  = os.path.join(TMPDIR, "sample-dnascope_transfer.vcf.gz")
+
+_OUT_BWA_ALN   = OUTPUT_VCF.replace(".vcf.gz", f"_bwa_deduped.{ALN_SUFFIX}")
+_OUT_MM2_ALN   = OUTPUT_VCF.replace(".vcf.gz", f"_mm2_deduped.{ALN_SUFFIX}")
+_METRICS_DIR   = OUTPUT_VCF.replace(".vcf.gz", "_metrics")
+
+# DNAscope input BAMs depend on mode
+if _FASTQ_MODE:
+    _DNASCOPE_BAMS = [_OUT_BWA_ALN, _OUT_MM2_ALN]
+else:
+    _DNASCOPE_BAMS = list(SAMPLE_INPUT) + [_MM2_BAM]
+
+_DNASCOPE_INPUT_FLAGS = " ".join(f"-i {b}" for b in _DNASCOPE_BAMS)
+
+# PCR indel model
+_PCR_INDEL = "NONE" if PCR_FREE else "CONSERVATIVE"
+
+# Read filter for Ultima
+_READ_FILTER = "--read_filter UltimaReadFilter" if TECH.upper() == "ULTIMA" else ""
+
+# ---------------------------------------------------------------------------
+# Default target
+# ---------------------------------------------------------------------------
+_ALL_TARGETS = [OUTPUT_VCF]
+
+if _FASTQ_MODE:
+    _ALL_TARGETS.extend([_OUT_BWA_ALN, _OUT_MM2_ALN])
+    if not SKIP_METRICS:
+        _ALL_TARGETS.append(_METRICS_DIR)
+
+rule all:
+    input: _ALL_TARGETS
+
+
+# ========================================================================
+# 1. KMC K-MER COUNTING (from FASTQ)
+# ========================================================================
+if _FASTQ_MODE:
+    rule kmc_fastq:
+        """Count k-mers with KMC from FASTQ files"""
+        input:
+            r1 = R1_FASTQ,
+            r2 = R2_FASTQ,
+        output:
+            kff   = _KMER_FILE,
+            paths = _KMER_PATHS,
+        params:
+            prefix = _KMER_PREFIX,
+            tmpdir = TMPDIR,
+            memory = KMC_MEMORY,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            # Write file list
+            > {output.paths}
+            for f in {input.r1} {input.r2}; do
+                echo "$f" >> {output.paths}
+            done
+            kmc -k29 -m{params.memory} -okff -t{threads} -hp \
+                @{output.paths} {params.prefix} {params.tmpdir}
+            """
+
+
+# ========================================================================
+# 2. KMC + EXTRACT FROM BAM (BAM input mode)
+# ========================================================================
+if not _FASTQ_MODE and SAMPLE_INPUT:
+    rule extract_kmc:
+        """Extract reads and count k-mers from BAM input"""
+        input:
+            bams = SAMPLE_INPUT,
+            ref  = REFERENCE,
+        output:
+            kff   = _KMER_FILE,
+            fastq = _EXT_FASTQ,
+        params:
+            model  = MODEL,
+            prefix = _KMER_PREFIX,
+            tmpdir = TMPDIR,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            samtools merge --reference {input.ref} -@ {threads} -u \
+                -o /dev/stdout {input.bams} | \
+            samtools view -@ {threads} -ub -F 0xf00 - | \
+            sentieon pgutil extract -t {threads} \
+                -T tp,t0 -S -PG \
+                -m {params.model}/extract.model \
+                -O fastq_compression=1 \
+                -o {output.fastq} -a - | \
+            kmc -k29 -okff -hp -ci0 -t1 /dev/stdin \
+                {params.prefix} {params.tmpdir}
+            """
+
+
+# ========================================================================
+# 3. BWA ALIGNMENT + PGUTIL EXTRACT (FASTQ mode)
+# ========================================================================
+if _FASTQ_MODE:
+    rule bwa_extract:
+        """BWA alignment with pgutil extract for pangenome reads"""
+        input:
+            r1    = R1_FASTQ,
+            r2    = R2_FASTQ,
+            ref   = REFERENCE,
+        output:
+            bam   = _BWA_BAM,
+            fastq = _EXT_FASTQ,
+        params:
+            model     = MODEL,
+            readgroup = READGROUP,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            UNZIP=$(command -v igzip 2>/dev/null && echo igzip || echo gzip)
+
+            # Construct RG with -bwa suffix
+            RG_BWA=$(echo '{params.readgroup}' | sed 's/\\tID:/\\tID:/' | sed 's/ID:\\([^\\t]*\\)/ID:\\1-bwa/')
+
+            sentieon bwa mem \
+                -R "$RG_BWA" \
+                -t {threads} \
+                -x {params.model}/bwa.model \
+                -K 2000000 \
+                {input.ref} \
+                <($UNZIP -dc {input.r1}) \
+                <($UNZIP -dc {input.r2}) | \
+            sentieon pgutil extract -t {threads} \
+                -T tp,t0 -S -PG \
+                -m {params.model}/extract.model \
+                -O fastq_compression=1 \
+                -o {output.fastq} \
+                -O bam_compression=1 \
+                -a - | \
+            sentieon util sort -i - -t {threads} \
+                -o {output.bam} --sam2bam
+            """
+
+
+# ========================================================================
+# 4. VG HAPLOTYPES (create sample-specific pangenome)
+# ========================================================================
+rule vg_haplotypes:
+    """Create sample-specific pangenome from reference pangenome + k-mers"""
+    input:
+        kff  = _KMER_FILE,
+        gbz  = GBZ,
+        hapl = HAPL,
+    output:
+        gbz = _SAMPLE_PAN,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        vg haplotypes \
+            -g {output.gbz} \
+            -t {threads} -v 1 \
+            -i {input.hapl} \
+            -k {input.kff} \
+            {input.gbz} \
+            --include-reference --diploid-sampling \
+            --set-reference GRCh38
+        """
+
+
+# ========================================================================
+# 5. VG CONVERT GBZ -> GFA
+# ========================================================================
+rule vg_convert_gfa:
+    """Convert sample pangenome GBZ to GFA format"""
+    input:
+        gbz = _SAMPLE_PAN,
+    output:
+        gfa = _SAMPLE_GFA,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        vg convert -t {threads} -f -Q GRCh38 {input.gbz} > {output.gfa}
+        """
+
+
+# ========================================================================
+# 6. VG PATHS -> FASTA
+# ========================================================================
+rule vg_paths_fasta:
+    """Extract haplotype sequences as FASTA from sample pangenome"""
+    input:
+        gbz = _SAMPLE_PAN,
+    output:
+        fasta = _SAMPLE_FASTA,
+    shell:
+        """
+        set -euo pipefail
+        vg paths -x {input.gbz} -H -F > {output.fasta}
+        """
+
+
+# ========================================================================
+# 7. MINIMAP2 ALIGNMENT WITH PGUTIL LIFT
+# ========================================================================
+rule minimap2_lift:
+    """Align extracted reads with minimap2 and lift to reference coordinates"""
+    input:
+        fastq = _EXT_FASTQ,
+        fasta = _SAMPLE_FASTA,
+        gfa   = _SAMPLE_GFA,
+        ref   = REFERENCE,
+    output:
+        bam = _MM2_BAM,
+    params:
+        model     = MODEL,
+        readgroup = READGROUP,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        # Build RG with -mm2 suffix and LR:1 tag
+        RG_MM2=$(echo '{params.readgroup}' | sed 's/ID:\\([^\\t]*\\)/ID:\\1-mm2/' | sed 's/$/\\tLR:1/')
+        # If BAM mode (no readgroup), use first RG from input BAMs
+        if [ -z "$RG_MM2" ]; then
+            RG_MM2="@RG\\tID:sample-mm2\\tSM:sample\\tLR:1"
+        fi
+
+        sentieon minimap2 \
+            -t {threads} \
+            -R "$RG_MM2" \
+            -a -y -I 16G \
+            -x {params.model}/minimap2.model \
+            {input.fasta} {input.fastq} | \
+        sentieon pgutil lift \
+            -t {threads} \
+            -F {input.ref}.fai \
+            -g {input.gfa} | \
+        sentieon util sort -i - \
+            -r {input.ref} \
+            -t {threads} \
+            -o {output.bam}
+        """
+
+
+# ========================================================================
+# 8. DEDUP — BWA (FASTQ mode only)
+# ========================================================================
+if _FASTQ_MODE:
+    _BWA_SCORE = os.path.join(TMPDIR, "sample-bwa-score.txt.gz")
+
+    rule locuscollector_bwa:
+        """LocusCollector for BWA-aligned reads"""
+        input:
+            bam = _BWA_BAM,
+            ref = REFERENCE,
+        output:
+            score = _BWA_SCORE,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                -i {input.bam} \
+                --algo LocusCollector {output.score}
+            """
+
+    rule dedup_bwa:
+        """Dedup for BWA-aligned reads"""
+        input:
+            bam   = _BWA_BAM,
+            score = _BWA_SCORE,
+            ref   = REFERENCE,
+        output:
+            bam = _OUT_BWA_ALN,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                -i {input.bam} \
+                --algo Dedup --score_info {input.score} \
+                {output.bam}
+            """
+
+
+# ========================================================================
+# 9. DEDUP — MM2 (FASTQ mode only, with IndelLeftAlignReadTransform)
+# ========================================================================
+if _FASTQ_MODE:
+    _MM2_SCORE = os.path.join(TMPDIR, "sample-mm2-score.txt.gz")
+    # RG ID for left-align filter
+    _MM2_RGID = READGROUP.split("ID:")[1].split("\\t")[0] + "-mm2" if "ID:" in READGROUP else "sample-mm2"
+    _LEFT_ALIGN_FILTER = f"--read_filter IndelLeftAlignReadTransform,rgid={_MM2_RGID}"
+
+    rule locuscollector_mm2:
+        """LocusCollector for minimap2-aligned reads"""
+        input:
+            bam = _MM2_BAM,
+            ref = REFERENCE,
+        output:
+            score = _MM2_SCORE,
+        params:
+            left_align = _LEFT_ALIGN_FILTER,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                -i {input.bam} \
+                {params.left_align} \
+                --algo LocusCollector {output.score}
+            """
+
+    rule dedup_mm2:
+        """Dedup for minimap2-aligned reads (with IndelLeftAlign)"""
+        input:
+            bam   = _MM2_BAM,
+            score = _MM2_SCORE,
+            ref   = REFERENCE,
+        output:
+            bam = _OUT_MM2_ALN,
+        params:
+            left_align = _LEFT_ALIGN_FILTER,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                -i {input.bam} \
+                {params.left_align} \
+                --algo Dedup --score_info {input.score} \
+                {output.bam}
+            """
+
+
+# ========================================================================
+# 10. METRICS COLLECTION (FASTQ mode, optional)
+# ========================================================================
+if _FASTQ_MODE and not SKIP_METRICS:
+    _METRIC_BASE = SAMPLE + ".txt"
+
+    rule metrics:
+        """Collect alignment metrics from deduped BAMs"""
+        input:
+            bwa_bam = _OUT_BWA_ALN,
+            mm2_bam = _OUT_MM2_ALN,
+            ref     = REFERENCE,
+        output:
+            metrics_dir = directory(_METRICS_DIR),
+        params:
+            metric_base = _METRIC_BASE,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            mkdir -p {output.metrics_dir}
+
+            sentieon driver -r {input.ref} -t {threads} \
+                -i {input.bwa_bam} -i {input.mm2_bam} \
+                --algo InsertSizeMetricAlgo {output.metrics_dir}/{params.metric_base}.insert_size.txt \
+                --algo MeanQualityByCycle   {output.metrics_dir}/{params.metric_base}.mean_qual_by_cycle.txt \
+                --algo BaseDistributionByCycle {output.metrics_dir}/{params.metric_base}.base_distribution_by_cycle.txt \
+                --algo QualDistribution     {output.metrics_dir}/{params.metric_base}.qual_distribution.txt \
+                --algo AlignmentStat        {output.metrics_dir}/{params.metric_base}.alignment_stat.txt \
+                --algo GCBias --summary {output.metrics_dir}/{params.metric_base}.gc_bias_summary.txt \
+                    {output.metrics_dir}/{params.metric_base}.gc_bias.txt \
+                --algo WgsMetricsAlgo --include_unpaired true \
+                    {output.metrics_dir}/{params.metric_base}.wgs.txt \
+                --algo CoverageMetrics {output.metrics_dir}/coverage
+
+            # Rehead WGS metrics
+            REHEAD_SCRIPT=$(python3 -c "from importlib_resources import files; print(files('sentieon_cli.scripts').joinpath('rehead_wgs_metrics.py'))")
+            sentieon pyexec "$REHEAD_SCRIPT" \
+                --metrics_file {output.metrics_dir}/{params.metric_base}.wgs.txt
+            """
+
+
+# ========================================================================
+# 11. DNASCOPE CALLING
+# ========================================================================
+# Determine DNAscope output — goes to transfer if pop_vcf is set
+_DNASCOPE_OUT = _RAW_VCF
+
+rule dnascope:
+    """Run DNAscope variant calling on aligned BAMs"""
+    input:
+        bams = _DNASCOPE_BAMS,
+        ref  = REFERENCE,
+    output:
+        vcf = _DNASCOPE_OUT,
+    params:
+        model       = MODEL,
+        bed_flag    = BED_FLAG,
+        dbsnp_flag  = DBSNP_FLAG,
+        read_filter = _READ_FILTER,
+        pcr_indel   = _PCR_INDEL,
+        input_flags = _DNASCOPE_INPUT_FLAGS,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        sentieon driver -r {input.ref} -t {threads} \
+            {params.input_flags} \
+            {params.bed_flag} \
+            {params.read_filter} \
+            --algo DNAscope \
+            --model {params.model}/dnascope.model \
+            --pcr_indel_model {params.pcr_indel} \
+            {params.dbsnp_flag} \
+            {output.vcf}
+        """
+
+
+# ========================================================================
+# 12. ANNOTATION TRANSFER (mandatory for pangenome — pop_vcf is required)
+# ========================================================================
+# Transfer target depends on whether model apply follows
+_TRANSFER_OUT = _TRANSFER_VCF if not SKIP_MODEL else OUTPUT_VCF
+
+rule annotation_transfer:
+    """Transfer annotations from population VCF using bcftools merge"""
+    input:
+        raw_vcf = _RAW_VCF,
+        pop_vcf = POP_VCF,
+    output:
+        vcf = _TRANSFER_OUT,
+    threads: CORES
+    shell:
+        """
+        set -euo pipefail
+        TRIM_SCRIPT=$(python3 -c "from importlib_resources import files; print(files('sentieon_cli.scripts').joinpath('trimalt.py'))")
+
+        bcftools merge --no-version --regions-overlap pos -m all \
+            -i 'AC_v20:sum,AF_v20:sum,AC_genomes:sum,AF_genomes:sum' \
+            {input.raw_vcf} {input.pop_vcf} | \
+        sentieon pyexec "$TRIM_SCRIPT" | \
+        bcftools view --no-version -W=tbi \
+            -o {output.vcf}
+        """
+
+
+# ========================================================================
+# 13. DNAMODELAPPLY (optional)
+# ========================================================================
+if not SKIP_MODEL:
+    rule model_apply:
+        """Apply ML model to called variants"""
+        input:
+            vcf = _TRANSFER_OUT,
+            ref = REFERENCE,
+        output:
+            vcf = OUTPUT_VCF,
+        params:
+            model = MODEL,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                --algo DNAModelApply \
+                --model {params.model}/dnascope.model \
+                --vcf {input.vcf} \
+                {output.vcf}
+            """

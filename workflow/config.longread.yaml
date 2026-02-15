@@ -1,0 +1,67 @@
+# ==========================================================================
+# Sentieon DNAscope LongRead — Snakemake config template
+# ==========================================================================
+# Copy this file, fill in your paths, then run:
+#   snakemake -s workflow/Snakefile.longread --configfile workflow/my_run.yaml -j <cores>
+
+# --------------------------------------------------------------------------
+# Required inputs
+# --------------------------------------------------------------------------
+reference:      /path/to/reference.fa          # Reference FASTA (indexed)
+model_bundle:   /path/to/model_bundle          # Sentieon model bundle dir
+output_vcf:     /path/to/output.vcf.gz         # Final output VCF path
+
+# Sequencing technology: "HiFi" (PacBio) or "ONT"
+tech: HiFi
+
+# --------------------------------------------------------------------------
+# Input data (provide EITHER sample_input OR fastq + readgroups, or both)
+# --------------------------------------------------------------------------
+# Pre-aligned BAMs/CRAMs
+sample_input: []
+#  - /path/to/sample.bam
+
+# Unaligned FASTQ files (one entry per file)
+fastq: []
+#  - /path/to/reads.fastq.gz
+
+# Readgroup strings (one per FASTQ file, same order)
+readgroups: []
+#  - "@RG\\tID:sample\\tSM:sample\\tPL:PACBIO"
+
+# --------------------------------------------------------------------------
+# Optional inputs
+# --------------------------------------------------------------------------
+# bed:                  ""           # Target regions BED (restricts calling)
+# haploid_bed:          ""           # Haploid regions BED (e.g. chrX/Y for males)
+# dbsnp:                ""           # dbSNP VCF for annotation
+# pop_vcf:              ""           # Population VCF for annotation transfer
+# cnv_excluded_regions: ""           # Regions to exclude from CNV calling
+# input_ref:            ""           # Reference for input CRAM files (if != reference)
+
+# --------------------------------------------------------------------------
+# Pipeline behaviour
+# --------------------------------------------------------------------------
+# cores:                64           # Max threads (default: workflow cores)
+# tmp_dir:              tmp          # Working directory for intermediates
+# align:                false        # Re-align input BAMs with minimap2
+# gvcf:                 false        # Also produce gVCF output
+# bam_format:           false        # Use BAM instead of CRAM for aligned output
+
+# --------------------------------------------------------------------------
+# Feature flags (set true to skip)
+# --------------------------------------------------------------------------
+# skip_small_variants:  false
+# skip_svs:             false
+# skip_cnv:             false        # Auto-set true for ONT
+# skip_mosdepth:        false
+
+# --------------------------------------------------------------------------
+# Advanced / hidden options (usually leave defaults)
+# --------------------------------------------------------------------------
+# fastq_taglist:        "*"
+# minimap2_args:        "-YL"
+# util_sort_args:       "--cram_write_options version=3.0,compressor=rans"
+# repeat_model:         ""           # Custom repeat model file
+# use_pbsv:             false        # Use pbsv instead of LongReadSV for SVs
+

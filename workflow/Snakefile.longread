@@ -1,0 +1,1024 @@
+"""
+Snakemake workflow for the Sentieon DNAscope LongRead pipeline.
+
+Mirrors the DAG from sentieon_cli.dnascope_longread.DNAscopeLRPipeline.build_dag()
+so that each original Job becomes a restartable Snakemake rule.
+
+Supports both HiFi (PacBio) and ONT sequencing technologies.
+
+Usage:
+    snakemake -s workflow/Snakefile.longread --configfile workflow/config.longread.yaml -j <cores>
+
+Prerequisites:
+    sentieon, samtools, bcftools, bedtools, mosdepth, igzip (optional),
+    hificnv (HiFi CNV), pbsv (optional SV)
+"""
+
+import os
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+configfile: "workflow/config.longread.yaml"
+
+REFERENCE   = config["reference"]
+MODEL       = config["model_bundle"]
+OUTPUT_VCF  = config["output_vcf"]
+SAMPLE      = os.path.basename(OUTPUT_VCF).replace(".vcf.gz", "")
+CORES       = config.get("cores", workflow.cores)
+TECH        = config.get("tech", "HiFi")           # HiFi | ONT
+GVCF        = config.get("gvcf", False)
+BAM_FMT     = config.get("bam_format", False)
+ALN_SUFFIX  = "bam" if BAM_FMT else "cram"
+
+TMPDIR      = config.get("tmp_dir", "tmp")
+BED         = config.get("bed", "")
+BED_FLAG    = f"--interval {BED}" if BED else ""
+DBSNP       = config.get("dbsnp", "")
+DBSNP_FLAG  = f"--dbsnp {DBSNP}" if DBSNP else ""
+POP_VCF     = config.get("pop_vcf", "")
+HAPLOID_BED = config.get("haploid_bed", "")
+
+# Inputs
+SAMPLE_INPUT    = config.get("sample_input", [])     # pre-aligned BAMs/CRAMs
+FASTQ           = config.get("fastq", [])            # FASTQ files
+READGROUPS      = config.get("readgroups", [])        # RG strings per FASTQ
+ALIGN_INPUT     = config.get("align", False)          # re-align input BAMs
+INPUT_REF       = config.get("input_ref", "")         # ref for input CRAM
+
+# Feature flags
+SKIP_SMALL_VARIANTS = config.get("skip_small_variants", False)
+SKIP_SVS            = config.get("skip_svs", False)
+SKIP_CNV            = config.get("skip_cnv", False) or (TECH.upper() == "ONT")
+SKIP_MOSDEPTH       = config.get("skip_mosdepth", False)
+USE_PBSV            = config.get("use_pbsv", False)
+
+# Advanced
+FASTQ_TAGLIST  = config.get("fastq_taglist", "*")
+MINIMAP2_ARGS  = config.get("minimap2_args", "-YL")
+UTIL_SORT_ARGS = config.get("util_sort_args",
+                             "--cram_write_options version=3.0,compressor=rans")
+REPEAT_MODEL   = config.get("repeat_model", "")
+CNV_EXCLUDED   = config.get("cnv_excluded_regions", "")
+
+# ---------------------------------------------------------------------------
+# Derived paths
+# ---------------------------------------------------------------------------
+# Aligned outputs from FASTQ
+_FQ_ALNS = [
+    os.path.join(
+        os.path.dirname(OUTPUT_VCF),
+        SAMPLE + f"_mm2_sorted_fq_{i}.{ALN_SUFFIX}",
+    )
+    for i in range(len(FASTQ))
+]
+
+# Re-aligned outputs from BAM inputs (when align=True)
+_REALN_BAMS = []
+if ALIGN_INPUT and SAMPLE_INPUT:
+    _REALN_BAMS = [
+        os.path.join(
+            os.path.dirname(OUTPUT_VCF),
+            SAMPLE + f"_mm2_sorted_{i}.{ALN_SUFFIX}",
+        )
+        for i in range(len(SAMPLE_INPUT))
+    ]
+
+# All aligned BAMs used downstream
+if ALIGN_INPUT:
+    _ALL_BAMS = _REALN_BAMS + _FQ_ALNS
+else:
+    _ALL_BAMS = list(SAMPLE_INPUT) + _FQ_ALNS
+
+_INPUT_FLAGS = " ".join(f"-i {b}" for b in _ALL_BAMS)
+
+# Script helpers (resolved at runtime in shell blocks)
+_VCF_MOD = (
+    '$(python3 -c "from importlib_resources import files;'
+    " print(files('sentieon_cli.scripts').joinpath('vcf_mod.py'))\")"
+)
+_GVCF_COMBINE = (
+    '$(python3 -c "from importlib_resources import files;'
+    " print(files('sentieon_cli.scripts').joinpath('gvcf_combine.py'))\")"
+)
+_TRIMALT = (
+    '$(python3 -c "from importlib_resources import files;'
+    " print(files('sentieon_cli.scripts').joinpath('trimalt.py'))\")"
+)
+
+# Repeat model: use provided or generate one
+_REPEAT_MODEL_FILE = REPEAT_MODEL if REPEAT_MODEL else os.path.join(TMPDIR, "out_repeat.model")
+_NEED_REPEAT_MODEL = not bool(REPEAT_MODEL)
+
+# Merge output depends on haploid_bed
+_DIPLOID_MERGED = os.path.join(TMPDIR, "out_diploid_merged.vcf.gz")
+_MERGE_OUT = _DIPLOID_MERGED if HAPLOID_BED else OUTPUT_VCF
+
+# ---------------------------------------------------------------------------
+# Default target
+# ---------------------------------------------------------------------------
+_ALL_TARGETS = []
+
+# Small variant output
+if not SKIP_SMALL_VARIANTS:
+    if HAPLOID_BED:
+        _ALL_TARGETS.append(OUTPUT_VCF)
+        if GVCF:
+            _ALL_TARGETS.append(OUTPUT_VCF.replace(".vcf.gz", ".g.vcf.gz"))
+    else:
+        _ALL_TARGETS.append(OUTPUT_VCF)
+        if GVCF:
+            _ALL_TARGETS.append(
+                _MERGE_OUT.replace(".vcf.gz", ".g.vcf.gz")
+            )
+
+# SV output
+if not SKIP_SVS:
+    _ALL_TARGETS.append(OUTPUT_VCF.replace(".vcf.gz", ".sv.vcf.gz"))
+
+# CNV output (HiFi only)
+if not SKIP_CNV:
+    _ALL_TARGETS.append(OUTPUT_VCF.replace(".vcf.gz", ".hificnv"))
+
+# Mosdepth
+if not SKIP_MOSDEPTH:
+    for i in range(len(_ALL_BAMS)):
+        _ALL_TARGETS.append(
+            OUTPUT_VCF.replace(".vcf.gz", f"_mosdepth_{i}")
+        )
+
+rule all:
+    input: _ALL_TARGETS
+
+
+# ========================================================================
+# 1. FASTQ ALIGNMENT (minimap2, per FASTQ file)
+# ========================================================================
+for _i, (_fq, _rg) in enumerate(zip(FASTQ, READGROUPS)):
+    rule:
+        name: f"lr_align_fastq_{_i}"
+        input:
+            fq  = str(_fq),
+            ref = REFERENCE,
+        output:
+            aln = _FQ_ALNS[_i],
+        params:
+            rg       = _rg,
+            model    = MODEL,
+            mm2_args = MINIMAP2_ARGS,
+            sort_args = UTIL_SORT_ARGS,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            UNZIP=$(command -v igzip 2>/dev/null && echo igzip || echo gzip)
+            $UNZIP -dc {input.fq} | \
+            sentieon minimap2 -t {threads} -a \
+                -x {params.model}/minimap2.model \
+                {params.mm2_args} \
+                {input.ref} - | \
+            sentieon util sort -i - -t {threads} \
+                -o {output.aln} --sam2bam \
+                {params.sort_args}
+            """
+
+
+# ========================================================================
+# 2. BAM RE-ALIGNMENT (minimap2, per input BAM — conditional on align=True)
+# ========================================================================
+if ALIGN_INPUT and SAMPLE_INPUT:
+    for _i, _bam in enumerate(SAMPLE_INPUT):
+        rule:
+            name: f"lr_realign_{_i}"
+            input:
+                bam = str(_bam),
+                ref = REFERENCE,
+            output:
+                aln = _REALN_BAMS[_i],
+            params:
+                model     = MODEL,
+                mm2_args  = MINIMAP2_ARGS,
+                sort_args = UTIL_SORT_ARGS,
+                taglist   = FASTQ_TAGLIST,
+                input_ref = f"--reference {INPUT_REF}" if INPUT_REF else "",
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                samtools fastq -@ 4 -T {params.taglist} \
+                    {params.input_ref} {input.bam} | \
+                sentieon minimap2 -t {threads} -a \
+                    -x {params.model}/minimap2.model \
+                    {params.mm2_args} \
+                    {input.ref} - | \
+                sentieon util sort -i - -t {threads} \
+                    -o {output.aln} --sam2bam \
+                    {params.sort_args}
+                """
+
+
+# ========================================================================
+# 3. MOSDEPTH QC (per aligned BAM)
+# ========================================================================
+if not SKIP_MOSDEPTH:
+    for _i, _bam in enumerate(_ALL_BAMS):
+        rule:
+            name: f"mosdepth_{_i}"
+            input:
+                bam = _bam,
+                ref = REFERENCE,
+            output:
+                outdir = directory(
+                    OUTPUT_VCF.replace(".vcf.gz", f"_mosdepth_{_i}")
+                ),
+            threads: 4
+            shell:
+                """
+                set -euo pipefail
+                mosdepth --fasta {input.ref} --threads {threads} \
+                    --by 500 --no-per-base --use-median \
+                    -T 1,3,5,10,15,20,30,40,50 \
+                    {output.outdir} {input.bam}
+                """
+
+
+# ========================================================================
+# 4. MERGE INPUT FILES (for CNV / pbsv — single merged BAM)
+# ========================================================================
+if USE_PBSV or not SKIP_CNV:
+    rule merge_bams:
+        """Merge aligned BAMs into a single BAM via ReadWriter"""
+        input:
+            bams = _ALL_BAMS,
+            ref  = REFERENCE,
+        output:
+            bam = os.path.join(TMPDIR, "longread_merged.bam"),
+        params:
+            input_flags = _INPUT_FLAGS,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                {params.input_flags} \
+                --algo ReadWriter {output.bam}
+            """
+
+
+# ========================================================================
+# 5. SV CALLING — LongReadSV (default)
+# ========================================================================
+if not SKIP_SVS and not USE_PBSV:
+    rule longreadsv:
+        """Call SVs with Sentieon LongReadSV"""
+        input:
+            bams = _ALL_BAMS,
+            ref  = REFERENCE,
+        output:
+            vcf = OUTPUT_VCF.replace(".vcf.gz", ".sv.vcf.gz"),
+        params:
+            input_flags = _INPUT_FLAGS,
+            model       = MODEL,
+            bed_flag    = BED_FLAG,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                {params.input_flags} {params.bed_flag} \
+                --algo LongReadSV \
+                --model {params.model}/longreadsv.model \
+                {output.vcf}
+            """
+
+
+# ========================================================================
+# 6. SV CALLING — pbsv (optional, HiFi only)
+# ========================================================================
+if not SKIP_SVS and USE_PBSV:
+    rule pbsv_discover:
+        """pbsv discover step"""
+        input:
+            bam = os.path.join(TMPDIR, "longread_merged.bam"),
+        output:
+            svsig = OUTPUT_VCF.replace(".vcf.gz", ".pbsv_discover.svsig.gz"),
+        shell:
+            """
+            set -euo pipefail
+            pbsv discover --hifi {input.bam} {output.svsig}
+            """
+
+    rule pbsv_call:
+        """pbsv call step"""
+        input:
+            svsig = OUTPUT_VCF.replace(".vcf.gz", ".pbsv_discover.svsig.gz"),
+            ref   = REFERENCE,
+        output:
+            vcf = OUTPUT_VCF.replace(".vcf.gz", ".pbsv.vcf"),
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            pbsv call -j {threads} {input.ref} {input.svsig} {output.vcf}
+            """
+
+
+
+# ========================================================================
+# 7. CNV CALLING — hificnv (HiFi only)
+# ========================================================================
+if not SKIP_CNV:
+    rule hificnv:
+        """Call CNVs with HiFiCNV (HiFi only)"""
+        input:
+            bam = os.path.join(TMPDIR, "longread_merged.bam"),
+            ref = REFERENCE,
+        output:
+            prefix = OUTPUT_VCF.replace(".vcf.gz", ".hificnv"),
+        params:
+            exclude = f"--exclude {CNV_EXCLUDED}" if CNV_EXCLUDED else "",
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            hificnv --bam {input.bam} --ref {input.ref} \
+                --threads {threads} \
+                --output-prefix {output.prefix} \
+                {params.exclude}
+            """
+
+
+# ========================================================================
+# SMALL VARIANT CALLING (multi-pass phasing workflow)
+# ========================================================================
+if not SKIP_SMALL_VARIANTS:
+
+    # ====================================================================
+    # 8. FIRST PASS — diploid calling (DNAscope)
+    # ====================================================================
+    rule first_pass_diploid:
+        """First-pass diploid variant calling with DNAscope"""
+        input:
+            bams = _ALL_BAMS,
+            ref  = REFERENCE,
+        output:
+            vcf  = os.path.join(TMPDIR, "out_diploid_tmp.vcf.gz"),
+            gvcf = os.path.join(TMPDIR, "out_diploid.g.vcf.gz") if GVCF else [],
+        params:
+            input_flags = _INPUT_FLAGS,
+            model       = MODEL,
+            bed_flag    = BED_FLAG,
+            dbsnp       = DBSNP_FLAG,
+            gvcf_algo   = (
+                f"--algo DNAscope --model {MODEL}/gvcf_model "
+                f"--emit_mode gvcf {DBSNP_FLAG} "
+                + os.path.join(TMPDIR, "out_diploid.g.vcf.gz")
+            ) if GVCF else "",
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                {params.input_flags} {params.bed_flag} \
+                {params.gvcf_algo} \
+                --algo DNAscope \
+                --model {params.model}/diploid_model \
+                {params.dbsnp} \
+                {output.vcf}
+            """
+
+    # ====================================================================
+    # 9. ANNOTATION TRANSFER — diploid (optional, pop_vcf)
+    # ====================================================================
+    # When pop_vcf is set, transfer annotations and feed into modelapply
+    _DIPLOID_TMP_VCF = os.path.join(TMPDIR, "out_diploid_tmp.vcf.gz")
+    _DIPLOID_MA_INPUT = _DIPLOID_TMP_VCF  # default: no transfer
+    if POP_VCF:
+        _DIPLOID_MA_INPUT = os.path.join(TMPDIR, "out_diploid_tmp_anno.vcf.gz")
+
+        rule transfer_diploid:
+            """Transfer annotations from population VCF to diploid calls"""
+            input:
+                vcf     = _DIPLOID_TMP_VCF,
+                pop_vcf = POP_VCF,
+            output:
+                vcf = _DIPLOID_MA_INPUT,
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                TRIM_SCRIPT={_TRIMALT}
+                bcftools merge --no-version --regions-overlap pos -m all \
+                    {input.vcf} {input.pop_vcf} | \
+                python3 "$TRIM_SCRIPT" | \
+                bcftools view --no-version -W=tbi -o {output.vcf}
+                """
+
+    # ====================================================================
+    # 10. MODEL APPLY — first pass (DNAModelApply on diploid)
+    # ====================================================================
+    rule first_modelapply:
+        """Apply ML model to first-pass diploid calls"""
+        input:
+            vcf = _DIPLOID_MA_INPUT,
+            ref = REFERENCE,
+        output:
+            vcf = os.path.join(TMPDIR, "out_diploid.vcf.gz"),
+        params:
+            model = MODEL,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                --algo DNAModelApply \
+                --model {params.model}/diploid_model \
+                -v {input.vcf} \
+                {output.vcf}
+            """
+
+    # ====================================================================
+    # 11. VARIANT PHASER
+    # ====================================================================
+    rule variant_phaser:
+        """Phase diploid variants and generate phased BED"""
+        input:
+            vcf  = os.path.join(TMPDIR, "out_diploid.vcf.gz"),
+            bams = _ALL_BAMS,
+            ref  = REFERENCE,
+        output:
+            vcf     = os.path.join(TMPDIR, "out_diploid_phased.vcf.gz"),
+            bed     = os.path.join(TMPDIR, "out_diploid_phased.bed"),
+            ext_vcf = os.path.join(TMPDIR, "out_diploid_phased.ext.vcf.gz"),
+        params:
+            input_flags = _INPUT_FLAGS,
+            bed_flag    = BED_FLAG,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                {params.input_flags} {params.bed_flag} \
+                --algo VariantPhaser \
+                -v {input.vcf} \
+                --out_bed {output.bed} \
+                --out_ext {output.ext_vcf} \
+                {output.vcf}
+            """
+
+
+
+    # ====================================================================
+    # 12. BED OPERATIONS — phased/unphased region extraction
+    # ====================================================================
+    # ONT: subset phased VCF to phased BED for the phased-phased VCF
+    if TECH.upper() == "ONT":
+        rule bcftools_subset_phased:
+            """Subset phased VCF to phased regions (ONT only)"""
+            input:
+                vcf = os.path.join(TMPDIR, "out_diploid_phased.vcf.gz"),
+                bed = os.path.join(TMPDIR, "out_diploid_phased.bed"),
+            output:
+                vcf = os.path.join(TMPDIR, "out_diploid_phased_phased.vcf.gz"),
+            shell:
+                """
+                set -euo pipefail
+                bcftools view -T {input.bed} {input.vcf} | \
+                sentieon util vcfconvert - {output.vcf}
+                """
+
+    # fai_to_bed: convert reference .fai to BED (when no --bed provided)
+    if not BED:
+        rule fai_to_bed:
+            """Convert reference FAI to BED for region arithmetic"""
+            input:
+                fai = REFERENCE + ".fai",
+            output:
+                bed = os.path.join(TMPDIR, "reference.bed"),
+            shell:
+                """
+                set -euo pipefail
+                awk -v OFS='\\t' '{{print $1,0,$2}}' {input.fai} > {output.bed}
+                """
+
+    _REGIONS_BED = BED if BED else os.path.join(TMPDIR, "reference.bed")
+
+    rule bedtools_subtract:
+        """Subtract phased BED from regions BED to get unphased BED"""
+        input:
+            regions = _REGIONS_BED,
+            phased  = os.path.join(TMPDIR, "out_diploid_phased.bed"),
+        output:
+            bed = os.path.join(TMPDIR, "out_unphased.bed"),
+        shell:
+            """
+            set -euo pipefail
+            bedtools subtract -a {input.regions} -b {input.phased} > {output.bed}
+            """
+
+    rule bcftools_subset_unphased:
+        """Subset phased VCF to unphased regions"""
+        input:
+            vcf = os.path.join(TMPDIR, "out_diploid_phased.vcf.gz"),
+            bed = os.path.join(TMPDIR, "out_unphased.bed"),
+        output:
+            vcf = os.path.join(TMPDIR, "out_diploid_phased_unphased.vcf.gz"),
+        shell:
+            """
+            set -euo pipefail
+            bcftools view -T {input.bed} {input.vcf} | \
+            sentieon util vcfconvert - {output.vcf}
+            """
+
+    # ====================================================================
+    # 13. REPEAT MODEL (conditional — generate if not provided)
+    # ====================================================================
+    if _NEED_REPEAT_MODEL:
+        rule repeatmodel:
+            """Generate RepeatModel from phased reads"""
+            input:
+                bams    = _ALL_BAMS,
+                ref     = REFERENCE,
+                bed     = os.path.join(TMPDIR, "out_diploid_phased.bed"),
+                ext_vcf = os.path.join(TMPDIR, "out_diploid_phased.ext.vcf.gz"),
+            output:
+                model = _REPEAT_MODEL_FILE,
+            params:
+                input_flags = _INPUT_FLAGS,
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                sentieon driver -r {input.ref} -t {threads} \
+                    {params.input_flags} \
+                    --interval {input.bed} \
+                    --read_filter "PhasedReadFilter,phased_vcf={input.ext_vcf},phase_select=tag" \
+                    --algo RepeatModel --phased \
+                    --read_flag_mask "drop=supplementary" \
+                    {output.model}
+                """
+
+    # ====================================================================
+    # 14. SECOND PASS — haploid calling (per haplotype: HP1, HP2)
+    # ====================================================================
+    # Technology-specific: HiFi gets DNAscope + DNAscopeHP; ONT gets DNAscopeHP only
+    for _phase in (1, 2):
+        _hp_std_vcf = os.path.join(TMPDIR, f"out_hap{_phase}_nohp_tmp.vcf.gz")
+        _hp_vcf = os.path.join(TMPDIR, f"out_hap{_phase}_tmp.vcf.gz")
+
+        if TECH.upper() == "HIFI":
+            rule:
+                name: f"second_pass_hp{_phase}"
+                input:
+                    bams    = _ALL_BAMS,
+                    ref     = REFERENCE,
+                    bed     = os.path.join(TMPDIR, "out_diploid_phased.bed"),
+                    ext_vcf = os.path.join(TMPDIR, "out_diploid_phased.ext.vcf.gz"),
+                    repeat  = _REPEAT_MODEL_FILE,
+                output:
+                    std_vcf = _hp_std_vcf,
+                    hp_vcf  = _hp_vcf,
+                params:
+                    input_flags = _INPUT_FLAGS,
+                    model       = MODEL,
+                    phase       = _phase,
+                    dbsnp       = DBSNP_FLAG,
+                threads: CORES
+                shell:
+                    """
+                    set -euo pipefail
+                    sentieon driver -r {input.ref} -t {threads} \
+                        {params.input_flags} \
+                        --interval {input.bed} \
+                        --read_filter "PhasedReadFilter,phased_vcf={input.ext_vcf},phase_select={params.phase}" \
+                        --algo DNAscope \
+                        --model {params.model}/haploid_model \
+                        {params.dbsnp} \
+                        {output.std_vcf} \
+                        --algo DNAscopeHP \
+                        --model {params.model}/haploid_hp_model \
+                        --pcr_indel_model {input.repeat} \
+                        {params.dbsnp} \
+                        {output.hp_vcf}
+                    """
+        else:
+            # ONT: DNAscopeHP only (no DNAscope in second pass)
+            rule:
+                name: f"second_pass_hp{_phase}"
+                input:
+                    bams    = _ALL_BAMS,
+                    ref     = REFERENCE,
+                    bed     = os.path.join(TMPDIR, "out_diploid_phased.bed"),
+                    ext_vcf = os.path.join(TMPDIR, "out_diploid_phased.ext.vcf.gz"),
+                    repeat  = _REPEAT_MODEL_FILE,
+                output:
+                    hp_vcf = _hp_vcf,
+                params:
+                    input_flags = _INPUT_FLAGS,
+                    model       = MODEL,
+                    phase       = _phase,
+                    dbsnp       = DBSNP_FLAG,
+                threads: CORES
+                shell:
+                    """
+                    set -euo pipefail
+                    sentieon driver -r {input.ref} -t {threads} \
+                        {params.input_flags} \
+                        --interval {input.bed} \
+                        --read_filter "PhasedReadFilter,phased_vcf={input.ext_vcf},phase_select={params.phase}" \
+                        --algo DNAscopeHP \
+                        --model {params.model}/haploid_hp_model \
+                        --pcr_indel_model {input.repeat} \
+                        {params.dbsnp} \
+                        {output.hp_vcf}
+                    """
+
+    # ====================================================================
+    # 15. HAPLOID PATCH — merge DNAscope and DNAscopeHP per haplotype
+    # ====================================================================
+    # For ONT: uses --phased (phased_phased VCF); for HiFi: uses --hap1/hap2 nohp
+    _PHASED_PHASED_VCF = os.path.join(TMPDIR, "out_diploid_phased_phased.vcf.gz")
+
+    if TECH.upper() == "HIFI":
+        rule haploid_patch:
+            """Merge DNAscope and DNAscopeHP haploid calls (HiFi)"""
+            input:
+                hap1_nohp = os.path.join(TMPDIR, "out_hap1_nohp_tmp.vcf.gz"),
+                hap2_nohp = os.path.join(TMPDIR, "out_hap2_nohp_tmp.vcf.gz"),
+                hap1_hp   = os.path.join(TMPDIR, "out_hap1_tmp.vcf.gz"),
+                hap2_hp   = os.path.join(TMPDIR, "out_hap2_tmp.vcf.gz"),
+            output:
+                patch1 = os.path.join(TMPDIR, "out_hap1_patch.vcf.gz"),
+                patch2 = os.path.join(TMPDIR, "out_hap2_patch.vcf.gz"),
+            params:
+                vcf_mod = _VCF_MOD,
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                VCF_MOD={params.vcf_mod}
+                sentieon pyexec "$VCF_MOD" -t {threads} haploid_patch \
+                    --patch1 {output.patch1} --patch2 {output.patch2} \
+                    --hap1 {input.hap1_nohp} --hap2 {input.hap2_nohp} \
+                    --hap1_hp {input.hap1_hp} --hap2_hp {input.hap2_hp}
+                """
+    else:
+        rule haploid_patch:
+            """Merge DNAscopeHP haploid calls with phased VCF (ONT)"""
+            input:
+                phased  = _PHASED_PHASED_VCF,
+                hap1_hp = os.path.join(TMPDIR, "out_hap1_tmp.vcf.gz"),
+                hap2_hp = os.path.join(TMPDIR, "out_hap2_tmp.vcf.gz"),
+            output:
+                patch1 = os.path.join(TMPDIR, "out_hap1_patch.vcf.gz"),
+                patch2 = os.path.join(TMPDIR, "out_hap2_patch.vcf.gz"),
+            params:
+                vcf_mod = _VCF_MOD,
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                VCF_MOD={params.vcf_mod}
+                sentieon pyexec "$VCF_MOD" -t {threads} haploid_patch \
+                    --patch1 {output.patch1} --patch2 {output.patch2} \
+                    --phased {input.phased} \
+                    --hap1_hp {input.hap1_hp} --hap2_hp {input.hap2_hp}
+                """
+
+    # ====================================================================
+    # 16. ANNOTATION TRANSFER — haploid patches (optional, pop_vcf)
+    # ====================================================================
+    _HAP1_PATCH = os.path.join(TMPDIR, "out_hap1_patch.vcf.gz")
+    _HAP2_PATCH = os.path.join(TMPDIR, "out_hap2_patch.vcf.gz")
+    _HAP1_MA_INPUT = _HAP1_PATCH
+    _HAP2_MA_INPUT = _HAP2_PATCH
+
+    if POP_VCF:
+        _HAP1_MA_INPUT = os.path.join(TMPDIR, "out_hap1_patch_anno.vcf.gz")
+        _HAP2_MA_INPUT = os.path.join(TMPDIR, "out_hap2_patch_anno.vcf.gz")
+
+        for _hp, _in_vcf, _out_vcf in [
+            (1, _HAP1_PATCH, _HAP1_MA_INPUT),
+            (2, _HAP2_PATCH, _HAP2_MA_INPUT),
+        ]:
+            rule:
+                name: f"transfer_hap{_hp}"
+                input:
+                    vcf     = _in_vcf,
+                    pop_vcf = POP_VCF,
+                output:
+                    vcf = _out_vcf,
+                params:
+                    trimalt = _TRIMALT,
+                threads: CORES
+                shell:
+                    """
+                    set -euo pipefail
+                    TRIM_SCRIPT={params.trimalt}
+                    bcftools merge --no-version --regions-overlap pos -m all \
+                        {input.vcf} {input.pop_vcf} | \
+                    python3 "$TRIM_SCRIPT" | \
+                    bcftools view --no-version -W=tbi -o {output.vcf}
+                    """
+
+    # ====================================================================
+    # 17. SECOND MODEL APPLY — haploid (per HP)
+    # ====================================================================
+    for _hp, _in_vcf, _out_vcf in [
+        (1, _HAP1_MA_INPUT, os.path.join(TMPDIR, "out_hap1.vcf.gz")),
+        (2, _HAP2_MA_INPUT, os.path.join(TMPDIR, "out_hap2.vcf.gz")),
+    ]:
+        rule:
+            name: f"second_modelapply_hp{_hp}"
+            input:
+                vcf = _in_vcf,
+                ref = REFERENCE,
+            output:
+                vcf = _out_vcf,
+            params:
+                model = MODEL,
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                sentieon driver -r {input.ref} -t {threads} \
+                    --algo DNAModelApply \
+                    --model {params.model}/haploid_model \
+                    -v {input.vcf} \
+                    {output.vcf}
+                """
+
+    # ====================================================================
+    # 18. UNPHASED REGION CALLING (DNAscopeHP with diploid_hp_model)
+    # ====================================================================
+    rule calling_unphased:
+        """Call variants in unphased regions with DNAscopeHP"""
+        input:
+            bams   = _ALL_BAMS,
+            ref    = REFERENCE,
+            bed    = os.path.join(TMPDIR, "out_unphased.bed"),
+            repeat = _REPEAT_MODEL_FILE,
+        output:
+            vcf = os.path.join(TMPDIR, "out_diploid_phased_unphased_hp.vcf.gz"),
+        params:
+            input_flags = _INPUT_FLAGS,
+            model       = MODEL,
+            dbsnp       = DBSNP_FLAG,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                {params.input_flags} \
+                --interval {input.bed} \
+                --algo DNAscopeHP \
+                --model {params.model}/diploid_hp_model \
+                --pcr_indel_model {input.repeat} \
+                {params.dbsnp} \
+                {output.vcf}
+            """
+
+    # ====================================================================
+    # 19. DIPLOID PATCH — merge unphased DNAscope + DNAscopeHP
+    # ====================================================================
+    rule diploid_patch:
+        """Patch unphased diploid DNAscope and DNAscopeHP VCFs"""
+        input:
+            vcf    = os.path.join(TMPDIR, "out_diploid_phased_unphased.vcf.gz"),
+            vcf_hp = os.path.join(TMPDIR, "out_diploid_phased_unphased_hp.vcf.gz"),
+        output:
+            vcf = os.path.join(TMPDIR, "out_diploid_unphased_patch.vcf.gz"),
+        params:
+            vcf_mod = _VCF_MOD,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            VCF_MOD={params.vcf_mod}
+            sentieon pyexec "$VCF_MOD" -t {threads} patch \
+                --vcf {input.vcf} --vcf_hp {input.vcf_hp} \
+                {output.vcf}
+            """
+
+    # ====================================================================
+    # 20. ANNOTATION TRANSFER — unphased patch (optional, pop_vcf)
+    # ====================================================================
+    _UNPHASED_PATCH = os.path.join(TMPDIR, "out_diploid_unphased_patch.vcf.gz")
+    _UNPHASED_MA_INPUT = _UNPHASED_PATCH
+
+    if POP_VCF:
+        _UNPHASED_MA_INPUT = os.path.join(TMPDIR, "out_diploid_unphased_patch_anno.vcf.gz")
+
+        rule transfer_unphased:
+            """Transfer annotations from pop VCF to unphased patch"""
+            input:
+                vcf     = _UNPHASED_PATCH,
+                pop_vcf = POP_VCF,
+            output:
+                vcf = _UNPHASED_MA_INPUT,
+            params:
+                trimalt = _TRIMALT,
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                TRIM_SCRIPT={params.trimalt}
+                bcftools merge --no-version --regions-overlap pos -m all \
+                    {input.vcf} {input.pop_vcf} | \
+                python3 "$TRIM_SCRIPT" | \
+                bcftools view --no-version -W=tbi -o {output.vcf}
+                """
+
+    # ====================================================================
+    # 21. MODEL APPLY — unphased (diploid_model_unphased)
+    # ====================================================================
+    rule modelapply_unphased:
+        """Apply ML model to unphased region calls"""
+        input:
+            vcf = _UNPHASED_MA_INPUT,
+            ref = REFERENCE,
+        output:
+            vcf = os.path.join(TMPDIR, "out_diploid_unphased.vcf.gz"),
+        params:
+            model = MODEL,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            sentieon driver -r {input.ref} -t {threads} \
+                --algo DNAModelApply \
+                --model {params.model}/diploid_model_unphased \
+                -v {input.vcf} \
+                {output.vcf}
+            """
+
+    # ====================================================================
+    # 22. MERGE DIPLOID — combine HP1, HP2, unphased, phased
+    # ====================================================================
+    rule merge_diploid:
+        """Merge all diploid call sets"""
+        input:
+            hap1     = os.path.join(TMPDIR, "out_hap1.vcf.gz"),
+            hap2     = os.path.join(TMPDIR, "out_hap2.vcf.gz"),
+            unphased = os.path.join(TMPDIR, "out_diploid_unphased.vcf.gz"),
+            phased   = os.path.join(TMPDIR, "out_diploid_phased.vcf.gz"),
+            bed      = os.path.join(TMPDIR, "out_diploid_phased.bed"),
+        output:
+            vcf = _MERGE_OUT,
+        params:
+            vcf_mod = _VCF_MOD,
+        threads: CORES
+        shell:
+            """
+            set -euo pipefail
+            VCF_MOD={params.vcf_mod}
+            sentieon pyexec "$VCF_MOD" -t {threads} merge \
+                --hap1 {input.hap1} --hap2 {input.hap2} \
+                --unphased {input.unphased} --phased {input.phased} \
+                --bed {input.bed} \
+                {output.vcf}
+            """
+
+    # ====================================================================
+    # 23. gVCF COMBINE (conditional on --gvcf)
+    # ====================================================================
+    if GVCF:
+        rule gvcf_combine:
+            """Combine gVCF with merged diploid VCF"""
+            input:
+                gvcf    = os.path.join(TMPDIR, "out_diploid.g.vcf.gz"),
+                out_vcf = _MERGE_OUT,
+                ref     = REFERENCE,
+            output:
+                gvcf = _MERGE_OUT.replace(".vcf.gz", ".g.vcf.gz"),
+            params:
+                gvcf_combine = _GVCF_COMBINE,
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                GVCF_COMBINE={params.gvcf_combine}
+                sentieon pyexec "$GVCF_COMBINE" -t {threads} \
+                    {input.ref} {input.gvcf} {input.out_vcf} - | \
+                sentieon util vcfconvert - {output.gvcf}
+                """
+
+    # ====================================================================
+    # 24. HAPLOID REGIONS CALLING (conditional on haploid_bed)
+    # ====================================================================
+    if HAPLOID_BED:
+        rule haploid_calling:
+            """Call variants in haploid regions (e.g., chrX/Y)"""
+            input:
+                bams   = _ALL_BAMS,
+                ref    = REFERENCE,
+                repeat = _REPEAT_MODEL_FILE,
+            output:
+                vcf    = os.path.join(TMPDIR, "haploid.vcf.gz"),
+                hp_vcf = os.path.join(TMPDIR, "haploid_hp.vcf.gz"),
+                gvcf   = os.path.join(TMPDIR, "haploid.g.vcf.gz") if GVCF else [],
+            params:
+                input_flags = _INPUT_FLAGS,
+                model       = MODEL,
+                haploid_bed = HAPLOID_BED,
+                dbsnp       = DBSNP_FLAG,
+                gvcf_algo   = (
+                    f"--algo DNAscope --model {MODEL}/gvcf_model "
+                    f"--emit_mode gvcf --ploidy 1 {DBSNP_FLAG} "
+                    + os.path.join(TMPDIR, "haploid.g.vcf.gz")
+                ) if GVCF else "",
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                sentieon driver -r {input.ref} -t {threads} \
+                    {params.input_flags} \
+                    --interval {params.haploid_bed} \
+                    --algo DNAscope \
+                    --model {params.model}/haploid_model \
+                    {params.dbsnp} \
+                    {output.vcf} \
+                    --algo DNAscopeHP \
+                    --model {params.model}/haploid_hp_model \
+                    --pcr_indel_model {input.repeat} \
+                    {params.dbsnp} \
+                    {output.hp_vcf} \
+                    {params.gvcf_algo}
+                """
+
+        # ================================================================
+        # 25. HAPLOID PATCH2 — merge haploid DNAscope + DNAscopeHP
+        # ================================================================
+        rule haploid_patch2:
+            """Patch haploid DNAscope and DNAscopeHP calls"""
+            input:
+                vcf    = os.path.join(TMPDIR, "haploid.vcf.gz"),
+                vcf_hp = os.path.join(TMPDIR, "haploid_hp.vcf.gz"),
+            output:
+                vcf = os.path.join(TMPDIR, "haploid_patched.vcf.gz"),
+            params:
+                vcf_mod = _VCF_MOD,
+            threads: CORES
+            shell:
+                """
+                set -euo pipefail
+                VCF_MOD={params.vcf_mod}
+                sentieon pyexec "$VCF_MOD" -t {threads} haploid_patch2 \
+                    --vcf {input.vcf} --vcf_hp {input.vcf_hp} \
+                    --patch_vcf {output.vcf}
+                """
+
+        # ================================================================
+        # 26. HAPLOID + DIPLOID CONCAT
+        # ================================================================
+        rule haploid_diploid_concat:
+            """Concatenate diploid merged and haploid patched VCFs"""
+            input:
+                diploid = _DIPLOID_MERGED,
+                haploid = os.path.join(TMPDIR, "haploid_patched.vcf.gz"),
+            output:
+                vcf = OUTPUT_VCF,
+            shell:
+                """
+                set -euo pipefail
+                bcftools concat -W=tbi --output {output.vcf} -aD \
+                    {input.diploid} {input.haploid}
+                """
+
+        # ================================================================
+        # 27. HAPLOID gVCF COMBINE + CONCAT (conditional on gvcf)
+        # ================================================================
+        if GVCF:
+            rule haploid_gvcf_combine:
+                """Combine haploid gVCF with haploid patched VCF"""
+                input:
+                    gvcf    = os.path.join(TMPDIR, "haploid.g.vcf.gz"),
+                    out_vcf = os.path.join(TMPDIR, "haploid_patched.vcf.gz"),
+                    ref     = REFERENCE,
+                output:
+                    gvcf = os.path.join(TMPDIR, "haploid_patched.g.vcf.gz"),
+                params:
+                    gvcf_combine = _GVCF_COMBINE,
+                threads: CORES
+                shell:
+                    """
+                    set -euo pipefail
+                    GVCF_COMBINE={params.gvcf_combine}
+                    sentieon pyexec "$GVCF_COMBINE" -t {threads} \
+                        {input.ref} {input.gvcf} {input.out_vcf} - | \
+                    sentieon util vcfconvert - {output.gvcf}
+                    """
+
+            rule haploid_gvcf_concat:
+                """Concatenate diploid and haploid gVCFs"""
+                input:
+                    diploid_gvcf = _DIPLOID_MERGED.replace(".vcf.gz", ".g.vcf.gz"),
+                    haploid_gvcf = os.path.join(TMPDIR, "haploid_patched.g.vcf.gz"),
+                output:
+                    gvcf = OUTPUT_VCF.replace(".vcf.gz", ".g.vcf.gz"),
+                shell:
+                    """
+                    set -euo pipefail
+                    bcftools concat -W=tbi --output {output.gvcf} -aD \
+                        {input.diploid_gvcf} {input.haploid_gvcf}
+                    """
