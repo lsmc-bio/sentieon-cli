@@ -9,3 +9,12 @@ secrets.env
 notes.txt
 .secrets
 .DS_Store
+# TLS material
+certs/
+tls/
+ssl/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
